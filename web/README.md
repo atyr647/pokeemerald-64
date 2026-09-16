@@ -20,13 +20,14 @@ Measured against the current build (`--stats`):
 
 ```
 where the .z64's bytes come from:
-  reused from your GBA ROM      5.60 MB   55.8%
-  repeated within the .z64      1.90 MB   18.9%
-  carried by the patch          2.54 MB   25.3%
+  reused from your GBA ROM      8.39 MB   65.2%
+  repeated within the .z64      1.87 MB   14.5%
+  carried by the patch          2.61 MB   20.3%
 ```
 
-So a 10.05 MB ROM ships as a 1.70 MB gzipped patch, and the majority of what
-comes out really does come off the user's cartridge.
+So a 12.86 MB ROM ships as a 1.75 MB gzipped patch, and two thirds of what
+comes out really does come off the user's cartridge -- the music and the
+instrument samples are the same bytes on both machines.
 
 ## Building the patch
 
