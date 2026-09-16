@@ -52,6 +52,8 @@ struct WaveData
 
 #define TONEDATA_TYPE_CGB    0x07
 #define TONEDATA_TYPE_FIX    0x08
+#define TONEDATA_TYPE_REV    0x10 // reversed sample
+#define TONEDATA_TYPE_CMP    0x20 // DPCM-compressed sample
 #define TONEDATA_TYPE_SPL    0x40 // key split
 #define TONEDATA_TYPE_RHY    0x80 // rhythm
 
@@ -407,15 +409,31 @@ extern const struct PokemonCrySong gPokemonCrySongTemplate;
 
 extern const struct ToneData voicegroup_dummy;
 
+#if defined(N64_PORT) && N64_PORT
+
+// On the GBA these are absolute linker symbols -- the *address* is the value,
+// which is why they are cast rather than dereferenced. A hosted build has no
+// way to make a symbol whose address is 4, and taking the address of a real
+// array instead yields a loop bound in the thousands, so they are constants
+// here. Four music players (BGM, SE1, SE2, SE3) and no line limit; the limit
+// existed to stop the GBA mixer overrunning VBlank and this port's mixer does
+// not run from that budget.
+#define NUM_MUSIC_PLAYERS 4
+#define MAX_LINES 0
+
+#else
+
 extern char gNumMusicPlayers[];
 extern char gMaxLines[];
 
 #define NUM_MUSIC_PLAYERS ((u16)gNumMusicPlayers)
 #define MAX_LINES ((u32)gMaxLines)
 
+#endif
+
 u32 umul3232H32(u32 multiplier, u32 multiplicand);
 void SoundMain(void);
-void SoundMainBTM(void);
+void SoundMainBTM(void *addr);
 void TrackStop(struct MusicPlayerInfo *mplayInfo, struct MusicPlayerTrack *track);
 void MPlayMain(struct MusicPlayerInfo *);
 void RealClearChain(void *x);

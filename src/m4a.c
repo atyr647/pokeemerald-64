@@ -422,6 +422,12 @@ void SampleFreqSet(u32 freq)
 
     m4aSoundVSyncOn();
 
+#if defined(N64_PORT) && N64_PORT
+    // On the GBA this waits for the start of a frame so the sample timer
+    // begins in a known phase. There is no timer here -- the AI keeps its own
+    // rate -- and this runs from m4aSoundInit() before interrupts are on, so
+    // VCOUNT would never advance and the wait would never end.
+#else
     while (*(vu8 *)REG_ADDR_VCOUNT == 159)
         ;
 
@@ -429,6 +435,7 @@ void SampleFreqSet(u32 freq)
         ;
 
     REG_TM0CNT_H = TIMER_ENABLE | TIMER_1CLK;
+#endif
 }
 
 void m4aSoundMode(u32 mode)

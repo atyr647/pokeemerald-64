@@ -57,6 +57,32 @@ static inline u32 N64_ReadRomWord(const void *p)
     return *(const volatile u32 *)p;
 }
 
+/* The PI bus only answers word-sized reads, so a byte or halfword load from
+ * cartridge space comes back with data from the wrong offset. Anything read
+ * out of a ROM-resident section has to go through the containing word: read
+ * it, then shift out the part wanted. Big-endian, so byte 0 of the word is
+ * the most significant.
+ *
+ * Reading four bytes in a row costs four of these; where that matters --
+ * the mixer walks a sample one byte per output frame -- callers keep the
+ * word and index into it themselves rather than calling this per byte. */
+static inline u8 N64_ReadRomByte(const void *p)
+{
+    uintptr_t a = (uintptr_t)p;
+    u32 w = N64_ReadRomWord((const void *)(a & ~(uintptr_t)3));
+    return (u8)(w >> (8 * (3 - (a & 3))));
+}
+
+/* Copy n bytes out of ROM a word at a time. Both ends must be 4-aligned,
+ * which every struct in a voicegroup is. */
+static inline void N64_ReadRomAligned(void *dst, const void *src, unsigned n)
+{
+    u32 *d = (u32 *)dst;
+    const u8 *s = (const u8 *)src;
+    for (unsigned i = 0; i < n; i += 4)
+        *d++ = N64_ReadRomWord(s + i);
+}
+
 extern void *__n64_pltt_buf;   /* points to __sw_palette_start in RDRAM */
 extern void *__n64_vram_buf;   /* points to __sw_vram_start  in RDRAM   */
 extern void *__n64_oam_buf;    /* points to __sw_oam_start   in RDRAM   */

@@ -1,339 +1,476 @@
 /*
  * src/n64/audio.c
  *
- * N64 port — Audio Interface (AI) driver + M4A low-level mixer replacement
+ * N64 port — Audio Interface driver and PCM/CGB mixer
  *
- * ---------------------------------------------------------------------
- * THE PORT IS SILENT, AND THIS IS WHY
+ * The GBA's sound hardware is two 8-bit DirectSound FIFOs drained by DMA at
+ * whatever rate a timer is programmed for, plus the Game Boy's four-channel
+ * PSG. The N64 has neither: the AI wants whole buffers of 16-bit stereo
+ * frames in RDRAM and plays them back at a rate the DAC divider sets. So the
+ * GBA mixer in src/m4a_1.s has no counterpart here, and this file replaces
+ * it -- everything above it, the sequencer in src/n64/m4a_core.c and the
+ * player in src/m4a.c, is the game's own code running unmodified.
  *
- * Everything below the sequencer works: the AI is configured, double
- * buffering runs off the AI interrupt, and MixAudioFrame() will resample
- * and mix every active PCM and CGB channel it is given.
+ * Division of labour, and it matters for timing:
  *
- * Nothing ever gives it one. MixAudioFrame() reads its channels out of
- * SoundInfo, which is the M4A engine's state, and the M4A engine is not in
- * this build. The plan was to keep the high-level sequencer from src/m4a.c
- * and replace only the ARM assembly mixer in src/m4a_1.s -- but both files
- * are in EXCLUDED_SRCS in Makefile.n64, and what stands in for them is the
- * block of stubs at the bottom of this file. m4aSongNumStart() does
- * nothing, MPlayMain() does nothing, ply_note() does nothing, so no channel
- * is ever started and every frame mixes to silence.
+ *   SoundMain(), once per VBlank, in the VI interrupt
+ *       Runs the sequencer, steps every channel's ADSR envelope, and leaves
+ *       the finished per-channel volumes in envelopeVolumeRight/Left.
  *
- * Sound therefore needs the sequencer written, not a bug fixed: MPlayMain's
- * per-track command walk, the ply_* command handlers, ply_note's channel
- * allocation, TrkVolPitSet, and the envelope stepping that SoundMain does
- * on GBA. That is the substance of m4a_1.s, in C.
- * ---------------------------------------------------------------------
+ *   MixAudioFrame(), once per AI interrupt, here
+ *       Walks those channels and resamples them into the next AI buffer.
  *
- * What is implemented here:
- *       1. Mixes all active PCM channels into a stereo 16-bit buffer.
- *       2. Mixes the 4 CGB channels (square, noise) via software synthesis.
- *       3. Feeds the buffer to the N64 AI (Audio Interface) via DMA.
+ * A buffer is 512 frames, which at 32 kHz is 16 ms -- one video frame. That
+ * is deliberate: envelopes advance once per VBlank, so a buffer spanning
+ * exactly one of them applies each envelope step to the audio it belongs to.
+ * It also holds output latency to a frame, which matters because the
+ * compositor runs at 10-15 fps and the two clocks are otherwise unrelated.
  *
- * Audio parameters:
- *   Sample rate: 32000 Hz (upgraded from GBA's ~13379 Hz for better quality)
- *   Format:      16-bit signed stereo (N64 AI requirement)
- *   Buffer size: 1024 stereo samples per AI DMA buffer = 4096 bytes
- *   Double-buffered so one buffer plays while the other is being filled.
+ * On sample rates: MidiKeyToFreq() hands back a channel's playback rate in
+ * Hz, and the GBA mixer turns that into a step per output sample with
  *
- * GBA M4A PCM channel format:
- *   Samples are 8-bit signed at the instrument's native sample rate.
- *   Each channel has a volume (0-255), panning (0=left, 127=centre, 255=right),
- *   pitch (frequency in Hz), and loop/envelope state.
+ *     step = frequency * divFreq / 2^23,  divFreq = (2^24 / outputRate + 1) / 2
  *
- * GBA CGB channel emulation:
- *   Square wave channels (CH1/CH2): variable duty cycle, envelope, sweep.
- *   Wave channel (CH3): 32 4-bit samples from wave RAM, swept by frequency.
- *   Noise channel (CH4): LFSR-based pseudo-random noise.
- *   These are synthesised in software and mixed into the PCM buffer.
+ * which is exact enough that a sample at its own rate steps by 1.0. The same
+ * arithmetic works here with divFreq recomputed for 32 kHz, so pitch comes
+ * out right without touching the engine's tables.
+ *
+ * Not carried over: the GBA mixer's reverb, which worked by feeding the PCM
+ * ring buffer back into itself and has no meaning for a buffer this size.
  */
 
 #include <string.h>
-#include <math.h>
 #include "global.h"
 #include "m4a.h"
 #include "gba/m4a_internal.h"
 #include "n64/asm_defs.h"
 
 /* -----------------------------------------------------------------------
- * N64 AI register access — byte-swap wrappers for big-endian MMIO
+ * N64 AI register access
  * --------------------------------------------------------------------- */
 #define AI_REG_WR(off, val) N64_HW_WR(N64_AI_BASE_REG, (off), (val))
 #define AI_REG_RD(off)      N64_HW_RD(N64_AI_BASE_REG, (off))
 
 /* -----------------------------------------------------------------------
- * Audio buffer configuration
+ * Buffering
  * --------------------------------------------------------------------- */
-#define N64_AUDIO_SAMPLE_RATE   32000
-#define N64_AUDIO_SAMPLES_PER_BUF 1024
-#define N64_AUDIO_BUF_BYTES     (N64_AUDIO_SAMPLES_PER_BUF * 2 * sizeof(s16))
-/* Two buffers for double-buffering */
-#define N64_AUDIO_NUM_BUFS      2
+#define N64_AUDIO_SAMPLE_RATE     32000
+#define N64_AUDIO_SAMPLES_PER_BUF 512
+#define N64_AUDIO_BUF_BYTES       (N64_AUDIO_SAMPLES_PER_BUF * 2 * (int)sizeof(s16))
+#define N64_AUDIO_NUM_BUFS        2
 
-/* Audio buffers — 8-byte aligned for AI DMA */
-static s16 sAudioBufs[N64_AUDIO_NUM_BUFS][N64_AUDIO_SAMPLES_PER_BUF * 2]
-    __attribute__((aligned(8)));
+/* The AI reads these by DMA. They are written through KSEG1 so the data
+ * cache stays out of it and no writeback is needed before the DMA starts. */
+static s16 sAudioBufsStorage[N64_AUDIO_NUM_BUFS][N64_AUDIO_SAMPLES_PER_BUF * 2]
+    __attribute__((aligned(16)));
+static s16 *sAudioBufs[N64_AUDIO_NUM_BUFS];
 
-static int sFillBuf  = 0;   /* index of buffer currently being filled */
-static int sPlayBuf  = 1;   /* index of buffer currently playing      */
-static volatile int sAIBusy = 0;  /* 1 = AI DMA in progress           */
+/* Channels accumulate here at full precision and are clamped once on the way
+ * out, instead of every channel clamping against the running total. */
+static s32 sMixBuf[N64_AUDIO_SAMPLES_PER_BUF * 2];
+
+static int sFillBuf = 0;
+static int sPlayBuf = 1;
+static volatile int sAIBusy = 0;
+
+/* step = frequency * N64_DIV_FREQ / 2^23 source samples per output sample */
+#define N64_DIV_FREQ  ((16777216 / N64_AUDIO_SAMPLE_RATE + 1) >> 1)
+#define N64_FW_SHIFT  23
+#define N64_FW_MASK   ((1u << N64_FW_SHIFT) - 1)
+
+/* WaveData's header is byte-swapped to big-endian at build time by
+ * tools/n64_wavedata_be.py, so the fields read as plain C. The loop flag is
+ * the byte the GBA engine calls `flags`, which is the high half of status. */
+#define WAVE_DATA_FLAG_LOOP 0xC0
+#define WaveIsLooped(wav)   ((((wav)->status >> 8) & WAVE_DATA_FLAG_LOOP) != 0)
 
 /* -----------------------------------------------------------------------
- * GBA master volume (set by REG_SOUNDCNT_L / REG_SOUNDCNT_H)
- * --------------------------------------------------------------------- */
-static inline int GetMasterVolume(void)
-{
-    /* GBA: SOUNDCNT_L bits 6-4 = output volume (0-7) for left/right */
-    u16 cntH = _REG16(REG_OFFSET_SOUNDCNT_H);
-    int vol = (cntH >> 2) & 3;  /* 0 = 25%, 1 = 50%, 2 = 100% */
-    return vol;  /* used as a shift: 0→>>2, 1→>>1, 2→>>0 */
-}
-
-/* -----------------------------------------------------------------------
- * SoundInfo — the M4A engine writes here; we read channel state from it.
- * The pointer is set by m4aSoundInit() via SOUND_INFO_PTR.
- * --------------------------------------------------------------------- */
-static inline struct SoundInfo *GetSoundInfo(void)
-{
-    return SOUND_INFO_PTR;
-}
-
-/* -----------------------------------------------------------------------
- * GBA M4A channel structure — mirrors m4a_internal.h SoundChannel
+ * Compressed samples
  *
- * We use the actual struct SoundChannel from gba/m4a_internal.h.
+ * Cries ship as MP2K's DPCM: a 0x21-byte block holds one absolute sample
+ * followed by 64 4-bit deltas indexing gDeltaEncodingTable, unpacking to 64
+ * samples. A channel playing one keeps a sample index rather than a pointer,
+ * and the decoded block is cached because playback walks it in order -- at
+ * 13 kHz that is one decode every 4.8 ms.
  * --------------------------------------------------------------------- */
-typedef struct SoundChannel M4AChannel;
+extern const s8 gDeltaEncodingTable[];
 
-/* Map audio.c field aliases to the actual m4a_internal.h field names */
-#define M4A_MAX_CHANNELS    MAX_DIRECTSOUND_CHANNELS
-#define M4A_STATUS_ACTIVE   SOUND_CHANNEL_SF_START
-#define M4A_STATUS_LOOP     SOUND_CHANNEL_SF_LOOP
-#define M4A_TYPE_CGB        TONEDATA_TYPE_CGB
+#define DPCM_BLOCK_BYTES   0x21
+#define DPCM_BLOCK_SAMPLES 64
 
-/* -----------------------------------------------------------------------
- * CGB channel state
- * --------------------------------------------------------------------- */
-typedef struct {
-    int     active;
-    int     type;       /* 1=square1, 2=square2, 3=wave, 4=noise */
-    int     duty;       /* square wave duty cycle (0-3) */
-    int     envVol;     /* envelope volume (0-15) */
-    int     envDir;     /* +1 = increase, -1 = decrease */
-    int     envSteps;   /* envelope step count */
-    int     envTimer;   /* envelope timer */
-    int     freq;       /* frequency (Hz) */
-    u32     phase;      /* oscillator phase (fixed-point) */
-    u32     phaseInc;   /* phase increment per sample */
-    int     lfsrState;  /* noise LFSR (15-bit) */
-    u8      waveRAM[16];/* CH3 wave RAM */
-} CgbChannel;
+static s8 sDecodedBlock[DPCM_BLOCK_SAMPLES];
+static const struct WaveData *sDecodedWave = NULL;
+static u32 sDecodedBlockIndex = 0xFFFFFFFFu;
 
-static CgbChannel sCgbChannels[4];
-
-/* Duty cycle tables (fraction of period that output is high) */
-static const float sDutyCycle[4] = {0.125f, 0.25f, 0.5f, 0.75f};
-
-/* -----------------------------------------------------------------------
- * Update CGB channels from NR1x-NR4x registers
- * --------------------------------------------------------------------- */
-static void UpdateCgbChannels(void)
+static void DecodeDpcmBlock(const struct WaveData *wav, u32 blockIndex)
 {
-    /* Square 1 (CH1) */
-    {
-        u8 nr10 = _REG8(REG_OFFSET_SOUND1CNT_L);
-        u8 nr11 = _REG8(REG_OFFSET_SOUND1CNT_H);
-        u8 nr12 = _REG8(REG_OFFSET_SOUND1CNT_H + 1);
-        u8 nr14 = _REG8(REG_OFFSET_SOUND1CNT_X + 1);
-        (void)nr10; (void)nr11;
-        CgbChannel *c = &sCgbChannels[0];
-        if (nr14 & 0x80) {  /* trigger */
-            c->active   = 1;
-            c->type     = 1;
-            c->envVol   = (nr12 >> 4) & 0xF;
-            c->envDir   = (nr12 & 0x08) ? 1 : -1;
-            c->envSteps = nr12 & 0x07;
-            c->envTimer = c->envSteps;
-        }
-        c->active = (c->active && c->envVol > 0);
-    }
+    const u8 *src = (const u8 *)wav + 0x10 + blockIndex * DPCM_BLOCK_BYTES;
+    s8 *dst = sDecodedBlock;
 
-    /* Square 2 (CH2) */
+    /* Blocks are 0x21 bytes, so they are not word-aligned and the source is
+     * in cartridge ROM. Pull the whole block through word reads once. */
+    u8 block[DPCM_BLOCK_BYTES];
     {
-        u8 nr21 = _REG8(REG_OFFSET_SOUND2CNT_L);
-        u8 nr22 = _REG8(REG_OFFSET_SOUND2CNT_L + 1);
-        u8 nr24 = _REG8(REG_OFFSET_SOUND2CNT_H + 1);
-        (void)nr21;
-        CgbChannel *c = &sCgbChannels[1];
-        if (nr24 & 0x80) {
-            c->active   = 1;
-            c->type     = 2;
-            c->envVol   = (nr22 >> 4) & 0xF;
-            c->envDir   = (nr22 & 0x08) ? 1 : -1;
-            c->envSteps = nr22 & 0x07;
-            c->envTimer = c->envSteps;
-        }
-        c->active = (c->active && c->envVol > 0);
-    }
-
-    /* Wave (CH3) */
-    {
-        u8 nr30 = _REG8(REG_OFFSET_SOUND3CNT_L);
-        u8 nr34 = _REG8(REG_OFFSET_SOUND3CNT_X + 1);
-        CgbChannel *c = &sCgbChannels[2];
-        c->active = (nr30 & 0x80) != 0;
-        if (nr34 & 0x80) {
-            c->type  = 3;
-            c->phase = 0;
-            /* Copy wave RAM from register file */
-            for (int i = 0; i < 16; i++)
-                c->waveRAM[i] = _REG8(REG_OFFSET_SOUND3CNT_L + 0x30 + i);
+        uintptr_t a = (uintptr_t)src;
+        u32 w = N64_ReadRomWord((const void *)(a & ~(uintptr_t)3));
+        for (unsigned i = 0; i < DPCM_BLOCK_BYTES; i++, a++)
+        {
+            if ((a & 3) == 0)
+                w = N64_ReadRomWord((const void *)a);
+            block[i] = (u8)(w >> (8 * (3 - (a & 3))));
         }
     }
 
-    /* Noise (CH4) */
+    const u8 *p = block;
+    s32 value = (s8)*p++;
+    *dst++ = (s8)value;
+
+    /* The first byte contributes only its low nibble; every byte after gives
+     * high then low, which is the order the encoder wrote them. */
+    u32 byte = *p++;
+    value += gDeltaEncodingTable[byte & 0xF];
+    *dst++ = (s8)value;
+
+    for (int i = 0; i < (DPCM_BLOCK_SAMPLES - 2) / 2; i++)
     {
-        u8 nr42 = _REG8(REG_OFFSET_SOUND4CNT_L + 1);
-        u8 nr44 = _REG8(REG_OFFSET_SOUND4CNT_H + 1);
-        CgbChannel *c = &sCgbChannels[3];
-        if (nr44 & 0x80) {
-            c->active    = 1;
-            c->type      = 4;
-            c->envVol    = (nr42 >> 4) & 0xF;
-            c->envDir    = (nr42 & 0x08) ? 1 : -1;
-            c->envSteps  = nr42 & 0x07;
-            c->lfsrState = 0x7FFF;
-        }
+        byte = *p++;
+        value += gDeltaEncodingTable[byte >> 4];
+        *dst++ = (s8)value;
+        value += gDeltaEncodingTable[byte & 0xF];
+        *dst++ = (s8)value;
     }
+
+    sDecodedWave = wav;
+    sDecodedBlockIndex = blockIndex;
+}
+
+static inline s32 DpcmSample(const struct WaveData *wav, u32 index)
+{
+    u32 block = index >> 6;
+
+    if (wav != sDecodedWave || block != sDecodedBlockIndex)
+        DecodeDpcmBlock(wav, block);
+
+    return sDecodedBlock[index & (DPCM_BLOCK_SAMPLES - 1)];
 }
 
 /* -----------------------------------------------------------------------
- * N64_MixAudioFrame — fill one stereo audio buffer
- *
- * Called each VBlank (or from AI interrupt) to prepare the next buffer.
+ * PCM channels
  * --------------------------------------------------------------------- */
-static void MixAudioFrame(s16 *buf, int samples)
+static void MixPcmChannels(struct SoundInfo *soundInfo, int samples)
 {
-    /* Zero the output buffer */
-    memset(buf, 0, samples * 2 * sizeof(s16));
+    /* A fixed-frequency voice plays one source sample per output sample at
+     * the engine's own mixing rate, so it is resampled from there. */
+    u32 fixedInc = (u32)soundInfo->pcmFreq * N64_DIV_FREQ;
 
-    struct SoundInfo *si = GetSoundInfo();
-    if (!si) return;
+    struct SoundChannel *chan = soundInfo->chans;
+    u32 maxChans = soundInfo->maxChans;
+    if (maxChans > MAX_DIRECTSOUND_CHANNELS)
+        maxChans = MAX_DIRECTSOUND_CHANNELS;
 
-    /* Read master volume from SOUNDCNT_H */
-    u16 cntH = _REG16(REG_OFFSET_SOUNDCNT_H);
-    int volShift = 2 - ((cntH >> 2) & 3);  /* 0=25%→>>2, 1=50%→>>1, 2=100%→>>0 */
-    if (volShift < 0) volShift = 0;
+    for (u32 c = 0; c < maxChans; c++, chan++)
+    {
+        u8 status = chan->statusFlags;
 
-    /* ------------------------------------------------------------------
-     * Mix PCM channels
-     * Each channel: 8-bit signed samples, resampled to N64_AUDIO_SAMPLE_RATE
-     * ------------------------------------------------------------------ */
-    M4AChannel *channels = si->chans;
-    int numChannels = si->maxChans;
-    if (numChannels > M4A_MAX_CHANNELS) numChannels = M4A_MAX_CHANNELS;
+        if (!(status & SOUND_CHANNEL_SF_ON))
+            continue;
 
-    for (int ch = 0; ch < numChannels; ch++) {
-        M4AChannel *c = &channels[ch];
-        if (!(c->statusFlags & M4A_STATUS_ACTIVE)) continue;
-        if (!c->wav || c->frequency == 0)          continue;
-        if (c->type & M4A_TYPE_CGB)                continue; /* handled below */
+        /* SoundMain has not opened this one yet, so it has no pointer. */
+        if (status & SOUND_CHANNEL_SF_START)
+            continue;
 
-        /* Resample ratio: increment = srcFreq / dstFreq in fixed-point (16.16) */
-        u32 rateInc = (u32)(((u64)c->frequency << 16) / N64_AUDIO_SAMPLE_RATE);
-        u32 pos     = c->fw;   /* current sample position (16.16 fixed-point) */
+        u8 type = chan->type;
+        if (type & TONEDATA_TYPE_CGB)
+            continue;
 
-        int volL = (c->leftVolume  * c->envelopeVolume) >> 8;
-        int volR = (c->rightVolume * c->envelopeVolume) >> 8;
-        if (volL < 0) volL = 0; if (volL > 255) volL = 255;
-        if (volR < 0) volR = 0; if (volR > 255) volR = 255;
+        struct WaveData *wav = chan->wav;
+        if (wav == NULL)
+            continue;
 
-        for (int i = 0; i < samples; i++) {
-            int sampleIdx = (int)(pos >> 16);
-            /* Loop handling */
-            if (sampleIdx >= (int)c->wav->size) {
-                if (c->statusFlags & M4A_STATUS_LOOP) {
-                    sampleIdx = (int)c->wav->loopStart +
-                                (sampleIdx - (int)c->wav->size) % (int)(c->wav->size - c->wav->loopStart);
-                } else {
-                    /* Channel done */
-                    c->statusFlags &= ~M4A_STATUS_ACTIVE;
-                    break;
+        s32 volR = chan->envelopeVolumeRight;
+        s32 volL = chan->envelopeVolumeLeft;
+
+        u32 inc = (type & TONEDATA_TYPE_FIX)
+                ? fixedInc
+                : chan->frequency * (u32)N64_DIV_FREQ;
+
+        u32 fw = chan->fw;
+        s32 count = (s32)chan->count;
+        int looped = (status & SOUND_CHANNEL_SF_LOOP) != 0;
+        s32 loopStart = (s32)wav->loopStart;
+        s32 loopLen = (s32)wav->size - loopStart;
+        s32 *out = sMixBuf;
+
+        if (type & TONEDATA_TYPE_CMP)
+        {
+            /* currentPointer holds a sample index for a compressed voice. */
+            s32 index = (s32)(uintptr_t)chan->currentPointer;
+
+            for (int i = 0; i < samples; i++, out += 2)
+            {
+                if (count <= 0)
+                {
+                    if (!looped || loopLen <= 0)
+                    {
+                        chan->statusFlags = 0;
+                        break;
+                    }
+                    s32 over = (-count) % loopLen;
+                    index = loopStart + over;
+                    count = loopLen - over;
+                }
+
+                s32 s = DpcmSample(wav, (u32)index);
+                out[0] += s * volR;
+                out[1] += s * volL;
+
+                fw += inc;
+                u32 advance = fw >> N64_FW_SHIFT;
+                if (advance)
+                {
+                    fw &= N64_FW_MASK;
+                    index += (s32)advance;
+                    count -= (s32)advance;
                 }
             }
 
-            /* 8-bit signed sample → 16-bit */
-            s8 sample = c->wav->data[sampleIdx];
-            s32 s16L  = (s32)sample * volL >> volShift;
-            s32 s16R  = (s32)sample * volR >> volShift;
-
-            /* Mix (clamp to s16 range) */
-            s32 mixL = (s32)buf[i * 2 + 0] + (s16L << 6);
-            s32 mixR = (s32)buf[i * 2 + 1] + (s16R << 6);
-            if (mixL >  32767) mixL =  32767;
-            if (mixL < -32768) mixL = -32768;
-            if (mixR >  32767) mixR =  32767;
-            if (mixR < -32768) mixR = -32768;
-            buf[i * 2 + 0] = (s16)mixL;
-            buf[i * 2 + 1] = (s16)mixR;
-
-            pos += rateInc;
+            chan->currentPointer = (s8 *)(uintptr_t)index;
         }
+        else
+        {
+            const s8 *p = chan->currentPointer;
 
-        c->fw = pos;  /* save position for next frame */
-    }
+            /* Samples live in cartridge ROM, where only word reads return
+             * the right data. Playback walks them in order and a step is
+             * usually well under one sample, so holding the containing word
+             * serves several output frames per read -- correct on the PI bus
+             * and fewer loads than a byte fetch would be anyway. */
+            uintptr_t wordAddr = ~(uintptr_t)0;
+            u32 word = 0;
 
-    /* ------------------------------------------------------------------
-     * Mix CGB channels (square waves, noise)
-     * ------------------------------------------------------------------ */
-    UpdateCgbChannels();
-
-    for (int ch = 0; ch < 4; ch++) {
-        CgbChannel *c = &sCgbChannels[ch];
-        if (!c->active) continue;
-
-        /* Phase increment for this channel's frequency */
-        if (c->freq > 0)
-            c->phaseInc = (u32)(((u64)c->freq << 16) / N64_AUDIO_SAMPLE_RATE);
-
-        for (int i = 0; i < samples; i++) {
-            s16 sample = 0;
-
-            if (c->type == 1 || c->type == 2) {
-                /* Square wave */
-                float duty  = sDutyCycle[(c->type == 1) ?
-                    ((_REG8(REG_OFFSET_SOUND1CNT_H) >> 6) & 3) :
-                    ((_REG8(REG_OFFSET_SOUND2CNT_L) >> 6) & 3)];
-                float phase = (float)(c->phase >> 16) / 65536.0f;
-                sample = (phase < duty) ? (s16)(c->envVol * 512) : (s16)(-c->envVol * 512);
-            } else if (c->type == 3) {
-                /* Wave channel: 32 4-bit samples in wave RAM */
-                u32 wavePos = (c->phase >> 16) & 31;
-                u8 nybble = (wavePos & 1)
-                    ? (c->waveRAM[wavePos / 2] & 0x0F)
-                    : (c->waveRAM[wavePos / 2] >> 4);
-                sample = (s16)((int)nybble - 8) * 2048;
-            } else if (c->type == 4) {
-                /* Noise: LFSR */
-                if (c->phase >> 16 != (c->phase - c->phaseInc) >> 16) {
-                    int feedback = ((c->lfsrState ^ (c->lfsrState >> 1)) & 1);
-                    c->lfsrState = (c->lfsrState >> 1) | (feedback << 14);
+            for (int i = 0; i < samples; i++, out += 2)
+            {
+                if (count <= 0)
+                {
+                    if (!looped || loopLen <= 0)
+                    {
+                        chan->statusFlags = 0;
+                        break;
+                    }
+                    s32 over = (-count) % loopLen;
+                    p = wav->data + loopStart + over;
+                    count = loopLen - over;
                 }
-                sample = (c->lfsrState & 1) ? (s16)(c->envVol * 512) : (s16)(-c->envVol * 512);
+
+                uintptr_t a = (uintptr_t)p;
+                if ((a & ~(uintptr_t)3) != wordAddr)
+                {
+                    wordAddr = a & ~(uintptr_t)3;
+                    word = N64_ReadRomWord((const void *)wordAddr);
+                }
+                s32 s = (s8)(word >> (8 * (3 - (a & 3))));
+
+                out[0] += s * volR;
+                out[1] += s * volL;
+
+                fw += inc;
+                u32 advance = fw >> N64_FW_SHIFT;
+                if (advance)
+                {
+                    fw &= N64_FW_MASK;
+                    p += advance;
+                    count -= (s32)advance;
+                }
             }
 
-            /* CGB channels are mono; apply to both channels at 25% master */
-            s32 mixL = (s32)buf[i * 2 + 0] + (sample >> 2);
-            s32 mixR = (s32)buf[i * 2 + 1] + (sample >> 2);
-            if (mixL >  32767) mixL =  32767;
-            if (mixL < -32768) mixL = -32768;
-            if (mixR >  32767) mixR =  32767;
-            if (mixR < -32768) mixR = -32768;
-            buf[i * 2 + 0] = (s16)mixL;
-            buf[i * 2 + 1] = (s16)mixR;
-
-            c->phase += c->phaseInc;
+            chan->currentPointer = (s8 *)p;
         }
+
+        chan->fw = fw;
+        chan->count = (u32)count;
+    }
+}
+
+/* -----------------------------------------------------------------------
+ * CGB channels
+ *
+ * src/m4a.c's CgbSound() emulates the Game Boy envelope, sweep and length
+ * counters in software and leaves the result in the CgbChannel structs, so
+ * what is left here is the oscillators: two squares, a 32-step wave, and an
+ * LFSR noise generator.
+ *
+ * Phase is 16.16 and the increment is computed once per buffer, which keeps
+ * the divides out of the sample loop.
+ * --------------------------------------------------------------------- */
+/* A CGB oscillator swings +/-8 at volume 15, so it is scaled up to sit
+ * alongside PCM, which reaches about +/-32,600 for one channel at full
+ * volume. Seven bits puts a single PSG channel at roughly half that, which
+ * is about where the GBA's mixer leaves it. */
+#define CGB_GAIN_SHIFT 7
+
+#define CGB_PHASE_BITS 16
+#define CGB_PHASE_ONE  (1u << CGB_PHASE_BITS)
+
+static u32 sCgbPhase[4];
+static u16 sCgbLfsr = 0x7FFF;
+
+/* Eighths of a period for which a square is high, by duty code. */
+static const u8 sDutyEighths[4] = {1, 2, 4, 6};
+
+/* NR43's divisor codes, doubled so code 0 -- which means a half -- fits. */
+static const u8 sNoiseDivisors[8] = {8, 16, 32, 48, 64, 80, 96, 112};
+
+static void MixCgbChannels(struct SoundInfo *soundInfo, int samples)
+{
+    struct CgbChannel *cgbChans = soundInfo->cgbChans;
+
+    if (cgbChans == NULL)
+        return;
+
+    for (int ch = 0; ch < 4; ch++)
+    {
+        struct CgbChannel *chan = &cgbChans[ch];
+
+        if (!(chan->statusFlags & SOUND_CHANNEL_SF_ON))
+            continue;
+
+        u32 volume = chan->envelopeVolume;   /* 0-15 */
+        if (volume == 0)
+            continue;
+
+        /* pan holds this channel's NR51 enable bits, already masked to its
+         * own pair: low nibble right, high nibble left. */
+        u32 pan = chan->pan;
+        s32 gainR = (pan & 0x0F) ? (s32)volume : 0;
+        s32 gainL = (pan & 0xF0) ? (s32)volume : 0;
+        if ((gainR | gainL) == 0)
+            continue;
+
+        gainR <<= CGB_GAIN_SHIFT;
+        gainL <<= CGB_GAIN_SHIFT;
+
+        u32 phase = sCgbPhase[ch];
+        u32 phaseInc;
+        s32 *out = sMixBuf;
+        u32 type = chan->type;
+
+        if (type == 4)
+        {
+            /* NR43: [shift:4][width:1][divisor:3]. The LFSR clocks at
+             * 524288 / divisor / 2^(shift+1) Hz. */
+            u32 nr43 = chan->frequency & 0xFF;
+            u32 divisor = sNoiseDivisors[nr43 & 7];
+            u32 shift = (nr43 >> 4) & 0xF;
+            u32 rate = (524288u * 2u / divisor) >> (shift + 1);
+
+            if (rate == 0)
+                continue;
+
+            phaseInc = (u32)(((u64)rate << CGB_PHASE_BITS) / N64_AUDIO_SAMPLE_RATE);
+            int narrow = (nr43 & 8) != 0;
+
+            for (int i = 0; i < samples; i++, out += 2)
+            {
+                s32 s = (sCgbLfsr & 1) ? -8 : 7;
+                out[0] += s * gainR;
+                out[1] += s * gainL;
+
+                phase += phaseInc;
+                while (phase >= CGB_PHASE_ONE)
+                {
+                    phase -= CGB_PHASE_ONE;
+                    u32 feedback = (sCgbLfsr ^ (sCgbLfsr >> 1)) & 1;
+                    sCgbLfsr >>= 1;
+                    sCgbLfsr |= feedback << 14;
+                    if (narrow)
+                        sCgbLfsr = (u16)((sCgbLfsr & ~0x40u) | (feedback << 6));
+                }
+            }
+        }
+        else
+        {
+            /* Square and wave share the period formula and differ only in
+             * the clock: 131072 Hz for a square, half that for the wave,
+             * which reads 32 steps per period rather than 8. */
+            u32 freqReg = chan->frequency & 0x7FF;
+            u32 period = 2048 - freqReg;
+            if (period == 0)
+                continue;
+
+            u32 hz = (type == 3 ? 65536u : 131072u) / period;
+            phaseInc = (u32)(((u64)hz << CGB_PHASE_BITS) / N64_AUDIO_SAMPLE_RATE);
+
+            if (type == 3)
+            {
+                /* Wave RAM is 16 bytes holding 32 nibbles, high nibble
+                 * first. NR32 scales them: mute, full, half, quarter. */
+                const u8 *wave = (const u8 *)chan->currentPointer;
+                if (wave == NULL)
+                    wave = (const u8 *)chan->wavePointer;
+                if (wave == NULL)
+                    continue;
+
+                u32 level = (_REG8(REG_OFFSET_SOUND3CNT_H + 1) >> 5) & 3;
+                if (level == 0)
+                    continue;
+                u32 shift = level - 1;   /* 0 = full, 1 = half, 2 = quarter */
+
+                for (int i = 0; i < samples; i++, out += 2)
+                {
+                    u32 step = (phase >> CGB_PHASE_BITS) & 31;
+                    u32 byte = wave[step >> 1];
+                    s32 nibble = (step & 1) ? (s32)(byte & 0xF) : (s32)(byte >> 4);
+                    s32 s = (nibble - 8) >> shift;
+
+                    out[0] += s * gainR;
+                    out[1] += s * gainL;
+                    phase += phaseInc;
+                }
+            }
+            else
+            {
+                u32 duty = ((u32)(uintptr_t)chan->wavePointer) & 3;
+                u32 high = sDutyEighths[duty];
+
+                for (int i = 0; i < samples; i++, out += 2)
+                {
+                    u32 eighth = (phase >> (CGB_PHASE_BITS - 3)) & 7;
+                    s32 s = (eighth < high) ? 7 : -8;
+
+                    out[0] += s * gainR;
+                    out[1] += s * gainL;
+                    phase += phaseInc;
+                }
+            }
+        }
+
+        sCgbPhase[ch] = phase;
+    }
+}
+
+/* -----------------------------------------------------------------------
+ * MixAudioFrame — fill one AI buffer
+ * --------------------------------------------------------------------- */
+static void MixAudioFrame(s16 *out, int samples)
+{
+    struct SoundInfo *soundInfo = SOUND_INFO_PTR;
+
+    memset(sMixBuf, 0, (size_t)samples * 2 * sizeof(s32));
+
+    if (soundInfo != NULL)
+    {
+        MixPcmChannels(soundInfo, samples);
+        MixCgbChannels(soundInfo, samples);
+    }
+
+    for (int i = 0; i < samples * 2; i++)
+    {
+        s32 v = sMixBuf[i];
+        if (v > 32767)
+            v = 32767;
+        else if (v < -32768)
+            v = -32768;
+        out[i] = (s16)v;
     }
 }
 
@@ -342,61 +479,58 @@ static void MixAudioFrame(s16 *buf, int samples)
  * --------------------------------------------------------------------- */
 void N64_InitAI(void)
 {
-    memset(sAudioBufs, 0, sizeof(sAudioBufs));
+    for (int i = 0; i < N64_AUDIO_NUM_BUFS; i++)
+        sAudioBufs[i] = (s16 *)((uintptr_t)sAudioBufsStorage[i] | 0x20000000u);
+
+    memset(sAudioBufsStorage, 0, sizeof(sAudioBufsStorage));
     sFillBuf = 0;
     sPlayBuf = 1;
     sAIBusy  = 0;
 
-    /* AI DAC rate: NTSC clock / (rate + 1) = sample rate
-     * NTSC AI clock = 48681812 Hz
-     * For 32000 Hz: 48681812 / 32000 - 1 ≈ 1521 */
+    /* AI DAC rate: NTSC clock / (rate + 1) = sample rate. The NTSC AI clock
+     * is 48681812 Hz, so 32 kHz wants a divider of 1520. */
     u32 dacRate = (48681812 / N64_AUDIO_SAMPLE_RATE) - 1;
     AI_REG_WR(AI_DACRATE_REG, dacRate);
     AI_REG_WR(AI_BITRATE_REG, 15);       /* 16-bit */
     AI_REG_WR(AI_CONTROL_REG, 1);        /* DMA enable */
 
-    /* Pre-fill first buffer (silence) */
     MixAudioFrame(sAudioBufs[sPlayBuf], N64_AUDIO_SAMPLES_PER_BUF);
 
-    /* Start playing the first buffer */
-    u32 physAddr = (u32)((uintptr_t)sAudioBufs[sPlayBuf] & 0x0FFFFFFF);
+    u32 physAddr = (u32)((uintptr_t)sAudioBufsStorage[sPlayBuf] & 0x0FFFFFFF);
     AI_REG_WR(AI_DRAM_ADDR_REG, physAddr);
     AI_REG_WR(AI_LEN_REG,       N64_AUDIO_BUF_BYTES);
     sAIBusy = 1;
 }
 
 /* -----------------------------------------------------------------------
- * N64_AudioRefill — called from interrupt.c when AI DMA buffer is empty
+ * N64_AudioRefill — the AI drained a buffer; queue the next and fill one
  * --------------------------------------------------------------------- */
 void N64_AudioRefill(void)
 {
-    /* Queue the fill buffer for playback */
-    u32 physAddr = (u32)((uintptr_t)sAudioBufs[sFillBuf] & 0x0FFFFFFF);
+    u32 physAddr = (u32)((uintptr_t)sAudioBufsStorage[sFillBuf] & 0x0FFFFFFF);
     AI_REG_WR(AI_DRAM_ADDR_REG, physAddr);
     AI_REG_WR(AI_LEN_REG,       N64_AUDIO_BUF_BYTES);
 
-    /* Swap buffers */
     int tmp  = sFillBuf;
     sFillBuf = sPlayBuf;
     sPlayBuf = tmp;
     sAIBusy  = 1;
-
-    /* Mix the next frame into the newly free fill buffer */
     MixAudioFrame(sAudioBufs[sFillBuf], N64_AUDIO_SAMPLES_PER_BUF);
 }
 
 /* -----------------------------------------------------------------------
- * m4aSoundVSync — called each VBlank from main.c
+ * m4aSoundVSync — called each VBlank
  *
- * On GBA this updates the M4A timing counters and triggers the sound DMA.
- * On N64 the AI interrupt drives audio; we just kick off mixing if the AI
- * is idle (e.g. on the very first frame).
+ * On the GBA this reloads the PCM DMA. Here the AI interrupt drives
+ * everything, so this only restarts the chain if it ever stops -- which it
+ * does exactly once, before the first AI interrupt arrives.
  * --------------------------------------------------------------------- */
 void m4aSoundVSync(void)
 {
-    if (!sAIBusy) {
+    if (!sAIBusy)
+    {
         MixAudioFrame(sAudioBufs[sFillBuf], N64_AUDIO_SAMPLES_PER_BUF);
-        u32 physAddr = (u32)((uintptr_t)sAudioBufs[sFillBuf] & 0x0FFFFFFF);
+        u32 physAddr = (u32)((uintptr_t)sAudioBufsStorage[sFillBuf] & 0x0FFFFFFF);
         AI_REG_WR(AI_DRAM_ADDR_REG, physAddr);
         AI_REG_WR(AI_LEN_REG,       N64_AUDIO_BUF_BYTES);
         sAIBusy = 1;
@@ -404,168 +538,21 @@ void m4aSoundVSync(void)
 }
 
 /* -----------------------------------------------------------------------
- * m4aSoundVSyncOff — called during soft reset (DoSoftReset in main.c)
- * Stop audio DMA.
- * --------------------------------------------------------------------- */
-void m4aSoundVSyncOff(void)
-{
-    AI_REG_WR(AI_CONTROL_REG, 0); /* disable DMA */
-    sAIBusy = 0;
-}
-
-/* -----------------------------------------------------------------------
- * m4aSoundMain — called each VBlank from main.c's VBlankIntr
+ * Pieces of the GBA engine with nothing to do here
  *
- * On GBA this runs the full M4A mixer in IWRAM.  On N64 the mixing is done
- * asynchronously in N64_AudioRefill() driven by the AI interrupt.  We still
- * call the M4A sequencer to advance music playback state.
+ * SoundMainRAM is the ARM mixer the GBA copies into IWRAM and jumps to --
+ * the code this file replaces. m4aSoundInit() still copies a buffer's worth
+ * of bytes out of it, so it has to be that big even though all of them are
+ * zero and nothing ever jumps there.
  * --------------------------------------------------------------------- */
-void m4aSoundMain(void)
-{
-    /* The M4A sequencer (m4a.c) updates channel state.  The actual PCM
-     * mixing is done in MixAudioFrame() called from N64_AudioRefill(). */
-    /* m4a.c will call SoundMain() which we stub below. */
-}
+char SoundMainRAM[0x800] = {0};
 
-/* -----------------------------------------------------------------------
- * SoundMain / SoundMainRAM — the GBA ARM assembly mixer entry points
- *
- * On GBA, m4a.c calls SoundMain() (or SoundMainRAM() when running from
- * IWRAM).  On N64 these are no-ops because the mixer runs from
- * MixAudioFrame() in the AI interrupt.
- * --------------------------------------------------------------------- */
-void SoundMain(void)    { /* no-op — mixing done in AI interrupt */ }
-/* SoundMainRAM: on GBA this is ARM code that gets copied to IWRAM.
- * On N64 it's a dummy char array so m4a.c's memcpy in m4aSoundInit
- * compiles but copies harmless zeros. */
-char SoundMainRAM[4] = {0};
+/* The one entry in gSongTable with no MIDI behind it. The table stores its
+ * address, so it has to exist; a single FINE command is a song that ends the
+ * instant it starts. */
+static u8 sDummySongPart[1] = { 0xB1 };
 
-/* -----------------------------------------------------------------------
- * M4A library internals — all from m4a_1.s (excluded from N64 build).
- * These are stub implementations; actual audio runs via N64_AudioRefill().
- * --------------------------------------------------------------------- */
-void SoundMainBTM(void)   { /* no-op */ }
-void TrackStop(struct MusicPlayerInfo *mpi, struct MusicPlayerTrack *trk)
-    { (void)mpi; (void)trk; }
-void MPlayMain(struct MusicPlayerInfo *mpi) { (void)mpi; }
-void MPlayExtender(struct CgbChannel *cgb)  { (void)cgb; }
-void FadeOutBody(struct MusicPlayerInfo *mpi) { (void)mpi; }
-void RealClearChain(void *x)  { (void)x; }
-void SampleFreqSet(u32 freq) { (void)freq; }
-void TrkVolPitSet(struct MusicPlayerInfo *mpi, struct MusicPlayerTrack *trk)
-    { (void)mpi; (void)trk; }
-
-/* M4A MIDI command handlers — called via jump table in m4a_tables */
-void ply_fine(struct MusicPlayerInfo *m, struct MusicPlayerTrack *t)  { (void)m;(void)t; }
-void ply_goto(struct MusicPlayerInfo *m, struct MusicPlayerTrack *t)  { (void)m;(void)t; }
-void ply_patt(struct MusicPlayerInfo *m, struct MusicPlayerTrack *t)  { (void)m;(void)t; }
-void ply_pend(struct MusicPlayerInfo *m, struct MusicPlayerTrack *t)  { (void)m;(void)t; }
-void ply_rept(struct MusicPlayerInfo *m, struct MusicPlayerTrack *t)  { (void)m;(void)t; }
-void ply_prio(struct MusicPlayerInfo *m, struct MusicPlayerTrack *t)  { (void)m;(void)t; }
-void ply_tempo(struct MusicPlayerInfo *m, struct MusicPlayerTrack *t) { (void)m;(void)t; }
-void ply_keysh(struct MusicPlayerInfo *m, struct MusicPlayerTrack *t) { (void)m;(void)t; }
-void ply_voice(struct MusicPlayerInfo *m, struct MusicPlayerTrack *t) { (void)m;(void)t; }
-void ply_vol(struct MusicPlayerInfo *m, struct MusicPlayerTrack *t)   { (void)m;(void)t; }
-void ply_pan(struct MusicPlayerInfo *m, struct MusicPlayerTrack *t)   { (void)m;(void)t; }
-void ply_bend(struct MusicPlayerInfo *m, struct MusicPlayerTrack *t)  { (void)m;(void)t; }
-void ply_bendr(struct MusicPlayerInfo *m, struct MusicPlayerTrack *t) { (void)m;(void)t; }
-void ply_lfodl(struct MusicPlayerInfo *m, struct MusicPlayerTrack *t) { (void)m;(void)t; }
-void ply_lfos(struct MusicPlayerInfo *m, struct MusicPlayerTrack *t)  { (void)m;(void)t; }
-void ply_mod(struct MusicPlayerInfo *m, struct MusicPlayerTrack *t)   { (void)m;(void)t; }
-void ply_modt(struct MusicPlayerInfo *m, struct MusicPlayerTrack *t)  { (void)m;(void)t; }
-void ply_tune(struct MusicPlayerInfo *m, struct MusicPlayerTrack *t)  { (void)m;(void)t; }
-void ply_port(struct MusicPlayerInfo *m, struct MusicPlayerTrack *t)  { (void)m;(void)t; }
-void ply_endtie(struct MusicPlayerInfo *m, struct MusicPlayerTrack *t){ (void)m;(void)t; }
-void ply_xxx(struct MusicPlayerInfo *m, struct MusicPlayerTrack *t)   { (void)m;(void)t; }
-void ply_xcmd_0D(struct MusicPlayerInfo *m, struct MusicPlayerTrack *t){ (void)m;(void)t; }
-void ply_xatta(struct MusicPlayerInfo *m, struct MusicPlayerTrack *t) { (void)m;(void)t; }
-void ply_xdeca(struct MusicPlayerInfo *m, struct MusicPlayerTrack *t) { (void)m;(void)t; }
-void ply_xsust(struct MusicPlayerInfo *m, struct MusicPlayerTrack *t) { (void)m;(void)t; }
-void ply_xrele(struct MusicPlayerInfo *m, struct MusicPlayerTrack *t) { (void)m;(void)t; }
-void ply_xiecv(struct MusicPlayerInfo *m, struct MusicPlayerTrack *t) { (void)m;(void)t; }
-void ply_xiecl(struct MusicPlayerInfo *m, struct MusicPlayerTrack *t) { (void)m;(void)t; }
-void ply_xleng(struct MusicPlayerInfo *m, struct MusicPlayerTrack *t) { (void)m;(void)t; }
-void ply_xswee(struct MusicPlayerInfo *m, struct MusicPlayerTrack *t) { (void)m;(void)t; }
-void ply_xtype(struct MusicPlayerInfo *m, struct MusicPlayerTrack *t) { (void)m;(void)t; }
-void ply_xwave(struct MusicPlayerInfo *m, struct MusicPlayerTrack *t) { (void)m;(void)t; }
-void ply_xwait(struct MusicPlayerInfo *m, struct MusicPlayerTrack *t) { (void)m;(void)t; }
-
-/* gNumMusicPlayers — defines how many music players exist.
- * char[] so NUM_MUSIC_PLAYERS can cast it to u16. We have 4 players. */
-char gNumMusicPlayers[2] = {4, 0};
-
-/* MusicPlayerInfo instances — defined here since m4a_1.s is excluded */
-struct MusicPlayerInfo gMPlayInfo_BGM;
-struct MusicPlayerInfo gMPlayInfo_SE1;
-struct MusicPlayerInfo gMPlayInfo_SE2;
-struct MusicPlayerInfo gMPlayInfo_SE3;
-
-/* gMaxLines — used by MPlayExtender for CGB channel limit; unused on N64 */
-char gMaxLines[1] = {0};
-
-/* umul3232H32 — multiply two 32-bit values and return the high 32 bits.
- * Used by MidiKeyToFreq for pitch calculation. */
-u32 umul3232H32(u32 a, u32 b)
-{
-    return (u32)(((u64)a * (u64)b) >> 32);
-}
-
-/* ply_note — note-on handler; no-op on N64 (we don't play GBA music format) */
-void ply_note(u32 note_cmd, struct MusicPlayerInfo *mpi, struct MusicPlayerTrack *trk)
-{
-    (void)note_cmd; (void)mpi; (void)trk;
-}
-
-/* Dummy song data — a 1-track song that ends immediately (FINE = 0xB1) */
-static u8 sDummySongPart[1] = { 0xB1 }; /* FINE command */
-
-/* mus_dummy / dummy_song_header — stub song headers referenced by song table.
- * The song table stores the ADDRESS of these as .4byte symbols.
- * The flexible array member 'part' must be last; we initialize via compound lit. */
-const struct SongHeader mus_dummy = {
-    .trackCount = 1, .blockCount = 0, .priority = 0, .reverb = 0,
-    .tone = NULL, .part = { sDummySongPart }
-};
 const struct SongHeader dummy_song_header = {
     .trackCount = 1, .blockCount = 0, .priority = 0, .reverb = 0,
     .tone = NULL, .part = { sDummySongPart }
 };
-
-/* -----------------------------------------------------------------------
- * High-level m4a API stubs (from src/m4a.c, excluded on N64)
- * All audio is silent/no-op on N64 — we have no GBA sound hardware.
- * --------------------------------------------------------------------- */
-struct SoundInfo gSoundInfo;
-
-/* PokemonCrySong stubs — cry songs array used by pokemon sound effects */
-struct PokemonCrySong gPokemonCrySongs[1];
-
-void m4aSoundInit(void)                                                       {}
-void m4aSoundVSyncOn(void)                                                    {}
-void m4aSongNumStart(u16 n)                                                   { (void)n; }
-void m4aSongNumStartOrChange(u16 n)                                           { (void)n; }
-void m4aSongNumStop(u16 n)                                                    { (void)n; }
-void m4aMPlayAllStop(void)                                                    {}
-void m4aMPlayStop(struct MusicPlayerInfo *mpi)                                { (void)mpi; }
-void m4aMPlayContinue(struct MusicPlayerInfo *mpi)                            { (void)mpi; }
-void m4aMPlayFadeOut(struct MusicPlayerInfo *mpi, u16 speed)                  { (void)mpi; (void)speed; }
-void m4aMPlayFadeOutTemporarily(struct MusicPlayerInfo *mpi, u16 speed)       { (void)mpi; (void)speed; }
-void m4aMPlayFadeIn(struct MusicPlayerInfo *mpi, u16 speed)                   { (void)mpi; (void)speed; }
-void m4aMPlayImmInit(struct MusicPlayerInfo *mpi)                             { (void)mpi; }
-void m4aMPlayTempoControl(struct MusicPlayerInfo *mpi, u16 tempo)             { (void)mpi; (void)tempo; }
-void m4aMPlayVolumeControl(struct MusicPlayerInfo *mpi, u16 bits, u16 vol)    { (void)mpi; (void)bits; (void)vol; }
-void m4aMPlayPitchControl(struct MusicPlayerInfo *mpi, u16 bits, s16 pitch)   { (void)mpi; (void)bits; (void)pitch; }
-void m4aMPlayPanpotControl(struct MusicPlayerInfo *mpi, u16 bits, s8 pan)     { (void)mpi; (void)bits; (void)pan; }
-
-/* Pokemon cry control stubs */
-struct MusicPlayerInfo *SetPokemonCryTone(struct ToneData *tone)              { (void)tone; return NULL; }
-void SetPokemonCryVolume(u8 val)                                              { (void)val; }
-void SetPokemonCryPanpot(s8 val)                                              { (void)val; }
-void SetPokemonCryPitch(s16 val)                                              { (void)val; }
-void SetPokemonCryLength(u16 val)                                             { (void)val; }
-void SetPokemonCryRelease(u8 val)                                             { (void)val; }
-void SetPokemonCryProgress(u32 val)                                           { (void)val; }
-bool32 IsPokemonCryPlaying(struct MusicPlayerInfo *mpi)                       { (void)mpi; return FALSE; }
-void SetPokemonCryChorus(s8 val)                                              { (void)val; }
-void SetPokemonCryStereo(u32 val)                                             { (void)val; }
-void SetPokemonCryPriority(u8 val)                                            { (void)val; }

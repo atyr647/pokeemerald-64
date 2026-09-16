@@ -110,13 +110,13 @@ N64_SRCS := \
     src/n64/tile_renderer.c     \
     src/n64/sprite_renderer.c   \
     src/n64/audio.c             \
+    src/n64/m4a_core.c          \
     src/n64/input.c             \
     src/n64/flashram.c          \
     src/n64/dma3_stub.c         \
     src/n64/gpu_regs_n64.c      \
     src/n64/rtc_stub.c          \
     src/n64/link_stub.c         \
-    src/n64/song_stubs.c        \
     src/n64/scanline_effect_n64.c \
     src/n64/rom_header.s        \
     src/n64/libc_impl.c
@@ -125,7 +125,6 @@ N64_SRCS := \
 # Exclude GBA-specific hardware files superseded by N64 equivalents
 EXCLUDED_SRCS := \
     src/m4a_1.s            \
-    src/m4a.c              \
     src/crt0.s             \
     src/rom_header.s       \
     src/agb_flash.c        \
@@ -169,7 +168,33 @@ ASM_SRCS := $(filter %.s,   $(ALL_SRCS))
 C_OBJS      := $(patsubst %.c,   $(BUILD_DIR)/%.o, $(C_SRCS))
 ASM_OBJS    := $(patsubst %.s,   $(BUILD_DIR)/%.o, $(ASM_SRCS))
 DATA_OBJS   := $(patsubst data/%.s, $(BUILD_DIR)/data/%.o, $(DATA_ASM_SRCS))
-ALL_OBJS    := $(C_OBJS) $(ASM_OBJS) $(DATA_OBJS)
+
+# ---------- Music ------------------------------------------
+# Every song is a MIDI file that mid2agb turns into an M4A track-command
+# stream. The port used to link src/n64/song_stubs.c instead -- 530 song
+# headers that all pointed at a single FINE command -- so the song table
+# resolved and nothing ever played. tools/n64_song_fixup.sh covers the three
+# ways mid2agb's output differs from what MIPS gas expects.
+MID_SUBDIR   := sound/songs/midi
+MID_BUILDDIR := $(BUILD_DIR)/$(MID_SUBDIR)
+MID_CFG      := $(MID_SUBDIR)/midi.cfg
+MID          := tools/mid2agb/mid2agb
+
+# The sampled instruments live as .wav next to 9-byte placeholder .bin files
+# that were committed in their place, so the ROM held no sample data either.
+# wav2agb turns each one into a struct WaveData followed by signed 8-bit
+# samples; tools/n64_wavedata_be.py then flips the header's five integer
+# fields, so the runtime reads them as plain C on a big-endian machine
+# instead of byte-swapping in the mixer's inner loop.
+WAV2AGB      := tools/wav2agb/wav2agb
+SAMPLE_WAVS  := $(sort $(wildcard sound/direct_sound_samples/*.wav))
+CRY_WAVS     := $(sort $(wildcard sound/direct_sound_samples/cries/*.wav))
+SAMPLE_BINS  := $(SAMPLE_WAVS:.wav=.bin) $(CRY_WAVS:.wav=.bin)
+
+MID_SRCS := $(sort $(wildcard $(MID_SUBDIR)/*.mid))
+MID_OBJS := $(patsubst $(MID_SUBDIR)/%.mid, $(MID_BUILDDIR)/%.o, $(MID_SRCS))
+
+ALL_OBJS    := $(C_OBJS) $(ASM_OBJS) $(DATA_OBJS) $(MID_OBJS)
 
 # ---------- Build rules -----------------------------------
 .PHONY: all clean rom emu crc-tool preproc-tool gfx-tool
@@ -183,6 +208,62 @@ rom: crc-tool preproc-tool gfx-tool $(BUILD_DIR)/$(ROM_NAME)
 # emulators need a boot stub that leaves RDRAM alone. Everything after the
 # 4 KB header is byte-identical to the hardware ROM.
 emu: $(BUILD_DIR)/$(EMU_ROM)
+
+# ---------- Music build rules ------------------------------
+$(MID): $(wildcard tools/mid2agb/*.cpp tools/mid2agb/*.h)
+	$(MAKE) -C tools/mid2agb
+
+# mid2agb emits GOTO and PATT targets as `.word <label>` inside the track's
+# command stream, at whatever byte offset the stream has reached. ARM gas
+# leaves those where they are; MIPS gas aligns data directives to their own
+# size by default, so it quietly pads the stream with zero bytes and the
+# player reads a NOP-ish 0x00 where a command should be. `.align 0` turns
+# that automatic alignment off. mid2agb writes exactly one `.align 2` before
+# the track data and one before the song header, so inserting `.align 0`
+# after the first leaves the header aligned while packing the streams.
+SONG_FIXUP := tools/n64_song_fixup.sh
+MID_ASFLAGS := -mips3 -mabi=32 -EB -G0
+
+# One rule per line of midi.cfg: everything after the colon is that song's
+# mid2agb options (voicegroup, reverb, master volume).
+# $1: song name, $2: options
+define N64_MID_RULE
+$(MID_BUILDDIR)/$1.s: $(MID_SUBDIR)/$1.mid $(MID_CFG) $(MID)
+	@mkdir -p $$(@D)
+	$(MID) $$< $$@ $2
+	@$(SONG_FIXUP) $$@
+endef
+
+define N64_MID_EXPANSION
+$(eval $(call N64_MID_RULE,$(basename $(patsubst %:,%,$(word 1,$1))),$(wordlist 2,999,$1)))
+endef
+
+$(foreach line,$(shell sed "s/ /__SPACE__/g" $(MID_CFG)),\
+    $(call N64_MID_EXPANSION,$(subst __SPACE__, ,$(line))))
+
+$(WAV2AGB): $(wildcard tools/wav2agb/*.cpp tools/wav2agb/*.h)
+	$(MAKE) -C tools/wav2agb
+
+# Cries are DPCM-compressed and single-shot; everything else is plain PCM.
+sound/direct_sound_samples/cries/%.bin: sound/direct_sound_samples/cries/%.wav $(WAV2AGB) tools/n64_wavedata_be.py
+	$(WAV2AGB) -b -c -l 1 --no-pad $< $@
+	@$(PYTHON) tools/n64_wavedata_be.py $@
+
+sound/%.bin: sound/%.wav $(WAV2AGB) tools/n64_wavedata_be.py
+	$(WAV2AGB) -b $< $@
+	@$(PYTHON) tools/n64_wavedata_be.py $@
+
+# MPlayDef.s holds the command-name equates every song includes. It needs the
+# same comment-stripping, so a fixed-up copy lives next to the songs and comes
+# first on the include path.
+$(MID_BUILDDIR)/MPlayDef.s: sound/MPlayDef.s $(SONG_FIXUP)
+	@mkdir -p $(@D)
+	cp $< $@
+	@$(SONG_FIXUP) --defs $@
+
+$(MID_BUILDDIR)/%.o: $(MID_BUILDDIR)/%.s $(MID_BUILDDIR)/MPlayDef.s
+	@mkdir -p $(@D)
+	$(AS) $(MID_ASFLAGS) -I $(MID_BUILDDIR) -I sound -o $@ $<
 
 # Build the N64 CRC fixer tool (host native, not MIPS)
 crc-tool: $(CHKSUM64)
@@ -302,6 +383,9 @@ $(BUILD_DIR)/%.o: %.s
 #   so asset generation must finish before the assembler runs.  Without this the
 #   rule races against the gfx step under -j and produces empty objects.
 AS_ARCH_FLAGS := -mips3 -mabi=32 -EB -G0
+# sound_data.s .incbin's every sample, so they have to exist first.
+$(BUILD_DIR)/data/sound_data.o: $(SAMPLE_BINS)
+
 $(BUILD_DIR)/data/%.o: data/%.s | $(GFX_STAMP)
 	@mkdir -p $(dir $@)
 	set -o pipefail; $(PREPROC) -b $< charmap.txt | gcc $(CPP_DATA_FLAGS) - | $(PREPROC) -ieb $< charmap.txt | $(AS) $(AS_ARCH_FLAGS) -o $@

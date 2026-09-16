@@ -40,8 +40,15 @@ MEMORY
      * Runs from above the boot stub to where the software GBA
      * palette/VRAM/OAM buffers begin (the stack lives at the very top of
      * that gap, growing down from __stack_top). Overflowing this is a link
-     * error rather than a mysterious corruption at runtime. */
-    RDRAM2 (rw)  : ORIGIN = 0x80380000, LENGTH = 0x410000
+     * error rather than a mysterious corruption at runtime.
+     *
+     * It used to start at a round 0x80380000, which left 128 KB between it
+     * and the boot stub doing nothing; reclaiming that is what let the song
+     * data in. There is another 170 KB below .boot, between it and the end
+     * of .bss, if this runs out again -- taking that one means moving
+     * .boot, whose VMA has to stay in step with the entry point in
+     * src/n64/rom_header.s. */
+    RDRAM2 (rw)  : ORIGIN = 0x80360800, LENGTH = 0x42F800
 }
 
 /*

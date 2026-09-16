@@ -325,12 +325,6 @@ u16   rfu_REQBN_watchLink_slave(u16 id, u8 *bm, u8 *r, u8 *pbm)
                                                      { (void)id;(void)bm;(void)r;(void)pbm; return 0; }
 
 /* -----------------------------------------------------------------------
- * MPlayJumpTableCopy — M4A function stub (m4a_1.s excluded)
- * --------------------------------------------------------------------- */
-#include "m4a.h"
-void MPlayJumpTableCopy(MPlayFunc *tbl) { (void)tbl; }
-
-/* -----------------------------------------------------------------------
  * ROM header stubs — RomHeaderGameCode / RomHeaderSoftwareVersion
  * (src/rom_header.s is the GBA version, excluded; provide N64 equivalents)
  * --------------------------------------------------------------------- */
