@@ -14,12 +14,28 @@
  *   6. Applies window clipping (WIN0/WIN1/WINOUT/WININ).
  *   7. Applies colour blending (BLDCNT / BLDALPHA / BLDY).
  *   8. Runs the scanline effect array (per-line scroll changes).
- *   9. Writes the final RGBA5551 pixel stream to gN64GBAFramebuffer.
+ *   9. Writes the final RGBA5551 pixel stream into the VI back buffer.
  *
- * Performance: the N64 VR4300 at 93.75 MHz is ~5.6× faster than the GBA
- * ARM7TDMI at 16.78 MHz.  A 240×160 frame with 4 BG layers needs roughly
- * 240×160×4 = 153,600 tile lookups per frame.  At 93 MIPS this is about
- * 1.65 ms of budget — comfortable within the 16.67 ms frame time.
+ * Performance. This is the most expensive thing the port does -- roughly
+ * three fifths of a frame -- so the shape of it is deliberate:
+ *
+ *   - Layers go straight into the VI back buffer, back to front, rather
+ *     than into per-layer line buffers that a second pass reads back.
+ *   - Whole unflipped tiles of an overlaying layer go out as four pixel
+ *     pairs through a per-palette-bank table, with a class byte saying
+ *     whether a pair can be stored whole, skipped, or has to go one pixel
+ *     at a time. Blank tiles, which are most of what the upper layers
+ *     hold, cost one test.
+ *   - Flipped tiles get their own unrolled case. They are about a quarter
+ *     of what a scene draws, and running them through the ragged per-pixel
+ *     path cost more than every unflipped tile put together.
+ *   - The tilemap is walked with a pointer instead of deriving each
+ *     entry's address from x, and the leading partial tile is the only one
+ *     that needs any offset arithmetic.
+ *
+ * What is left is about five instructions per pixel per layer. Going
+ * materially below that means not drawing four layers in software at all,
+ * which is what the RDP is for.
  */
 
 #include <string.h>
@@ -29,7 +45,10 @@
 /* -----------------------------------------------------------------------
  * External framebuffer (declared in vi.c)
  * --------------------------------------------------------------------- */
-extern u16 gN64GBAFramebuffer[DISPLAY_WIDTH * DISPLAY_HEIGHT];
+/* The picture's top-left pixel inside the VI back buffer, and the distance
+ * between its rows. The compositor writes there directly; see vi.c. */
+extern u16 *gN64FrameBuf;
+#define FB_STRIDE N64_VI_WIDTH
 
 /* -----------------------------------------------------------------------
  * Palette helpers
@@ -167,6 +186,46 @@ static u16 sLine[4][DISPLAY_WIDTH];
 static u16 sPal4[256];
 static u16 sPal8[256];
 
+/* -----------------------------------------------------------------------
+ * Pixel-pair tables
+ *
+ * A 4bpp tile row is one word: four bytes, each holding two pixels. For a
+ * layer drawn over what is already there -- which is three of the four, and
+ * most of the frame -- looking the byte up rather than its two nibbles
+ * turns a tile into four loads and four stores instead of eight of each,
+ * and a class byte says whether the pair can go out whole.
+ *
+ *   sPairs[bank][byte]   the two pixels, ready to store as one word
+ *   sPairCls[bank][byte] 0 = both transparent, 1 = both opaque, 2 = mixed
+ *
+ * Only these two tables exist, and only the overlay path uses them: giving
+ * the bottom layer its own copy with the backdrop substituted was another
+ * 16 KB against an 8 KB data cache for a layer that is an eighth of the
+ * work. Banks are built on first use in a frame, so a scene pays for the
+ * handful it draws with rather than all sixteen.
+ * --------------------------------------------------------------------- */
+static u32 sPairs[16][256];
+static u8  sPairCls[16][256];
+static u16 sPairBuilt;   /* bank bitmask, cleared each frame */
+
+static void BuildPairBank(u32 bank)
+{
+    const u16 *pal = sPal4 + bank * 16;
+    u32 *pairs = sPairs[bank];
+    u8  *cls   = sPairCls[bank];
+
+    for (int b = 0; b < 256; b++) {
+        /* Within a byte the low nibble is the left pixel. */
+        u16 p0 = pal[b & 0xF];
+        u16 p1 = pal[b >> 4];
+
+        pairs[b] = ((u32)p0 << 16) | p1;
+        cls[b]   = (p0 && p1) ? 1 : ((p0 | p1) ? 2 : 0);
+    }
+
+    sPairBuilt |= (u16)(1u << bank);
+}
+
 static void BuildPaletteCache(const u16 *pltt)
 {
     for (int i = 0; i < 256; i++) {
@@ -175,6 +234,7 @@ static void BuildPaletteCache(const u16 *pltt)
         sPal4[i] = (i & 0xF) ? c : 0;
     }
     sPal8[0] = 0;
+    sPairBuilt = 0;
 }
 
 /* How a layer's pixels reach their destination.
@@ -192,6 +252,19 @@ static void BuildPaletteCache(const u16 *pltt)
 #define LAYER_WRITE 0   /* store every pixel; transparent becomes 0        */
 #define LAYER_BASE  1   /* store every pixel; transparent becomes `fill`   */
 #define LAYER_OVER  2   /* store only opaque pixels, leaving the rest      */
+
+/* One pixel pair of an overlaying layer: store it whole when both pixels
+ * are opaque, drop it when neither is, otherwise one at a time. */
+#define PAIR_OVER(o, out, x, i, cls, pairval)                               \
+    do {                                                                    \
+        u32 c__ = (cls);                                                    \
+        if (c__ == 1) { (o)[i] = (pairval); }                               \
+        else if (c__) {                                                     \
+            u32 p__ = (pairval);                                            \
+            if (p__ >> 16)     (out)[(x) + (i) * 2 + 0] = (u16)(p__ >> 16); \
+            if (p__ & 0xFFFFu) (out)[(x) + (i) * 2 + 1] = (u16)p__;         \
+        }                                                                   \
+    } while (0)
 
 #define LAYER_PUT(dst, colour)                       \
     do {                                             \
@@ -235,23 +308,34 @@ void RenderTextLineImpl(const BgDesc *bg, int y, u16 *out, int mode, u16 fill)
     const u8 *mapRow = vram + bg->screenBase + sbyPart * BG_SCREEN_SIZE
                      + tileY * 64;
 
+    /* Walk the tilemap entries rather than deriving each address from x:
+     * they are two bytes apart until the row wraps at 32 tiles, where a
+     * 512-wide map crosses into its second screenblock. Only the first tile
+     * of a line can start partway in, so `first` is zero from the second
+     * iteration onward and the whole-tile case needs no arithmetic. */
+    int tx = hOfs & mapWMask;
+    int tileX = (tx & 0xFF) >> 3;
+    int block = splitX ? (tx >> 8) : 0;
+    const u8 *entryPtr = mapRow + block * BG_SCREEN_SIZE + tileX * 2;
+    int first = tx & 7;
+
+    /* Neighbouring tiles nearly always share a palette bank, so its tables
+     * are looked up once and carried along the line. */
+    int lastBank = -1;
+    const u32 *bankPairs = NULL;
+    const u8  *bankCls = NULL;
+
     int x = 0;
     while (x < DISPLAY_WIDTH)
     {
-        int tx  = (x + hOfs) & mapWMask;
-
-        int entryOffset = (tx & 0xFF) >> 2;   /* tile index * 2 bytes */
-        if (splitX && (tx >> 8))
-            entryOffset += BG_SCREEN_SIZE;
-        u16 entry = __builtin_bswap16(*(const u16 *)(mapRow + entryOffset));
+        u16 entry = __builtin_bswap16(*(const u16 *)entryPtr);
 
         int tileNum = entry & 0x3FF;
         int hFlip   = (entry >> 10) & 1;
         int vFlip   = (entry >> 11) & 1;
         int py      = vFlip ? 7 - rowInTile : rowInTile;
 
-        int first = tx & 7;                 /* first pixel of this tile   */
-        int n     = 8 - first;              /* pixels left in the tile    */
+        int n = 8 - first;                  /* pixels left in the tile    */
         if (x + n > DISPLAY_WIDTH)
             n = DISPLAY_WIDTH - x;
 
@@ -271,14 +355,90 @@ void RenderTextLineImpl(const BgDesc *bg, int y, u16 *out, int mode, u16 fill)
              * byte, and within a byte the low nibble is the left pixel. */
             const u32 *row = (const u32 *)(vram + charBase
                                            + tileNum * TILE_SIZE_4BPP + py * 4);
-            const u16 *pal = sPal4 + ((entry >> 12) & 0xF) * 16;
+            int bank = (entry >> 12) & 0xF;
+            const u16 *pal = sPal4 + bank * 16;
             u32 w = *row;
 
-            if (n == 8 && !hFlip) {
-                /* The common case: a whole unflipped tile */
-                if (mode == LAYER_OVER && w == 0) {
+            if (mode == LAYER_OVER && bank != lastBank) {
+                lastBank = bank;
+                if (!(sPairBuilt & (1u << bank)))
+                    BuildPairBank(bank);
+                bankPairs = sPairs[bank];
+                bankCls   = sPairCls[bank];
+            }
+
+
+            if (mode == LAYER_OVER && n == 8 && !hFlip && !(x & 1)) {
+                /* The hot case: an unflipped tile of an overlaying layer
+                 * landing on a word boundary, so it goes out as four pixel
+                 * pairs. Whether x is even is fixed for the whole line by
+                 * the scroll offset, so the test predicts perfectly. */
+                if (w == 0) {
                     /* A blank tile contributes nothing when overlaying, and
                      * blank tiles are most of what the upper layers hold. */
+                } else {
+                    const u32 *pairs = bankPairs;
+                    const u8 *cls = bankCls;
+                    u32 *o = (u32 *)(out + x);
+                    u32 b0 = (w >> 24) & 0xFF, b1 = (w >> 16) & 0xFF;
+                    u32 b2 = (w >>  8) & 0xFF, b3 = w & 0xFF;
+                    u32 c0 = cls[b0], c1 = cls[b1];
+                    u32 c2 = cls[b2], c3 = cls[b3];
+
+                    /* A fully opaque tile is the common case and skips the
+                     * per-pair tests entirely. */
+                    if ((c0 & c1 & c2 & c3) == 1) {
+                        o[0] = pairs[b0];
+                        o[1] = pairs[b1];
+                        o[2] = pairs[b2];
+                        o[3] = pairs[b3];
+                    } else {
+                        PAIR_OVER(o, out, x, 0, c0, pairs[b0]);
+                        PAIR_OVER(o, out, x, 1, c1, pairs[b1]);
+                        PAIR_OVER(o, out, x, 2, c2, pairs[b2]);
+                        PAIR_OVER(o, out, x, 3, c3, pairs[b3]);
+                    }
+                }
+            } else if (n == 8 && !hFlip) {
+                /* A whole unflipped tile: the bottom layer, which has no
+                 * table of its own, or one that fell on an odd pixel. */
+                if (mode == LAYER_OVER && w == 0) {
+                    /* blank tile, nothing to overlay */
+                } else {
+                    LAYER_PUT(out[x + 0], pal[(w >> 24) & 0xF]);
+                    LAYER_PUT(out[x + 1], pal[(w >> 28) & 0xF]);
+                    LAYER_PUT(out[x + 2], pal[(w >> 16) & 0xF]);
+                    LAYER_PUT(out[x + 3], pal[(w >> 20) & 0xF]);
+                    LAYER_PUT(out[x + 4], pal[(w >>  8) & 0xF]);
+                    LAYER_PUT(out[x + 5], pal[(w >> 12) & 0xF]);
+                    LAYER_PUT(out[x + 6], pal[(w >>  0) & 0xF]);
+                    LAYER_PUT(out[x + 7], pal[(w >>  4) & 0xF]);
+                }
+            } else if (n == 8 && hFlip) {
+                /* A whole flipped tile. Flipped tiles are a quarter of
+                 * everything this scene draws, and sending them through the
+                 * ragged path below -- which works the shift out per pixel
+                 * -- cost more than all the unflipped ones together. */
+                if (mode == LAYER_OVER && w == 0) {
+                    /* blank tile, nothing to overlay */
+                } else {
+                    LAYER_PUT(out[x + 0], pal[(w >>  4) & 0xF]);
+                    LAYER_PUT(out[x + 1], pal[(w >>  0) & 0xF]);
+                    LAYER_PUT(out[x + 2], pal[(w >> 12) & 0xF]);
+                    LAYER_PUT(out[x + 3], pal[(w >>  8) & 0xF]);
+                    LAYER_PUT(out[x + 4], pal[(w >> 20) & 0xF]);
+                    LAYER_PUT(out[x + 5], pal[(w >> 16) & 0xF]);
+                    LAYER_PUT(out[x + 6], pal[(w >> 28) & 0xF]);
+                    LAYER_PUT(out[x + 7], pal[(w >> 24) & 0xF]);
+                }
+            } else if (n == 8) {
+                /* A whole tile, but the scroll offset put it on an odd
+                 * pixel so the pairs cannot be stored as words. Straight
+                 * halfwords, still with the shifts unrolled -- working them
+                 * out per pixel the way the ragged path below does costs
+                 * twice as much, and half of all lines land here. */
+                if (mode == LAYER_OVER && w == 0) {
+                    /* blank tile, nothing to overlay */
                 } else {
                     LAYER_PUT(out[x + 0], pal[(w >> 24) & 0xF]);
                     LAYER_PUT(out[x + 1], pal[(w >> 28) & 0xF]);
@@ -290,6 +450,9 @@ void RenderTextLineImpl(const BgDesc *bg, int y, u16 *out, int mode, u16 fill)
                     LAYER_PUT(out[x + 7], pal[(w >>  4) & 0xF]);
                 }
             } else {
+                /* A partial tile at either end of the line, or a flipped
+                 * one. Few enough of these that the per-pixel shift is not
+                 * worth unrolling. */
                 for (int i = 0; i < n; i++) {
                     int sx = first + i;
                     if (hFlip) sx = 7 - sx;
@@ -300,6 +463,15 @@ void RenderTextLineImpl(const BgDesc *bg, int y, u16 *out, int mode, u16 fill)
         }
 
         x += n;
+        first = 0;
+
+        if (++tileX == 32) {
+            tileX = 0;
+            block ^= splitX;
+            entryPtr = mapRow + block * BG_SCREEN_SIZE;
+        } else {
+            entryPtr += 2;
+        }
     }
 }
 
@@ -547,7 +719,9 @@ void N64_CompositeFrame(void)
 
     /* Forced blank: fill with white */
     if (dispcnt & DISPCNT_FORCED_BLANK) {
-        memset(gN64GBAFramebuffer, 0xFF, sizeof(gN64GBAFramebuffer));
+        for (int y = 0; y < DISPLAY_HEIGHT; y++)
+            memset(gN64FrameBuf + y * FB_STRIDE, 0xFF,
+                   DISPLAY_WIDTH * sizeof(u16));
         return;
     }
 
@@ -605,7 +779,7 @@ void N64_CompositeFrame(void)
         for (int i = 0; i < 4; i++)
             ParseBgDesc(i, &bgs[i], bgMode);
 
-        u16 *rowOut = gN64GBAFramebuffer + y * DISPLAY_WIDTH;
+        u16 *rowOut = gN64FrameBuf + y * FB_STRIDE;
 
         if (fastPath) {
             /* Straight into the framebuffer row, back to front. The

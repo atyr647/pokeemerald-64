@@ -15,8 +15,7 @@
  * The full software compositor pipeline is:
  *   1. N64_CompositeFrame()   — tile renderer (tile_renderer.c)
  *   2. N64_CompositeSprites() — sprite renderer (sprite_renderer.c)
- *   3. N64_BlitGBAFrame()     — scale/centre into VI framebuffer (vi.c)
- *   4. N64_VISwapBuffers()    — flip front/back framebuffers
+ *   3. N64_VISwapBuffers()    — write back the cache, flip framebuffers
  *
  * CopyBufferedValuesToGpuRegs() is called from VBlankIntr(), which runs in
  * interrupt context (see interrupt.c's N64_DispatchIntr).  On real GBA
@@ -133,8 +132,8 @@ void CopyBufferedValuesToGpuRegs(void)
  * --------------------------------------------------------------------- */
 extern void N64_CompositeFrame(void);      /* tile_renderer.c   */
 extern void N64_CompositeSprites(void);    /* sprite_renderer.c */
-extern void N64_BlitGBAFrame(void);        /* vi.c              */
 extern void N64_VISwapBuffers(void);       /* vi.c              */
+extern void N64_VIPaintBorders(void);      /* vi.c              */
 
 /* -----------------------------------------------------------------------
  * Compositor profiling overlay
@@ -185,6 +184,8 @@ void N64_RunDeferredCompositor(void)
         return;
     sGN64RenderPending = 0;
 
+    N64_VIPaintBorders();
+
 #if N64_PROFILE_OVERLAY
     static u32 sPrevEnd = 0;
     static u32 sFrames  = 0;
@@ -193,8 +194,7 @@ void N64_RunDeferredCompositor(void)
     u32 t1 = C0Count();
     N64_CompositeSprites();
     u32 t2 = C0Count();
-    N64_BlitGBAFrame();
-    u32 t3 = C0Count();
+    u32 t3 = t2;
 
     ProfileBits(0, t1 - t0);            /* backgrounds        */
     ProfileBits(1, t2 - t1);            /* sprites            */
@@ -210,7 +210,6 @@ void N64_RunDeferredCompositor(void)
     /* Run the full software compositor */
     N64_CompositeFrame();
     N64_CompositeSprites();
-    N64_BlitGBAFrame();
     N64_VISwapBuffers();
 #endif
 

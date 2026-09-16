@@ -4,7 +4,7 @@
  * N64 port — software sprite (OBJ) compositor
  *
  * Reads the 128-entry OAM buffer that the game builds via BuildOamBuffer()
- * and composites sprites over the BG layers in gN64GBAFramebuffer.
+ * and composites sprites over the BG layers in the VI back buffer.
  *
  * OAM entry format (from include/gba/types.h struct OamData):
  *   Word 0 (lo 16): y[7:0], affineMode[1:0], objMode[1:0], mosaic, bpp,
@@ -27,7 +27,9 @@
 #include "global.h"
 #include "n64/defines.h"
 
-extern u16 gN64GBAFramebuffer[DISPLAY_WIDTH * DISPLAY_HEIGHT];
+/* The picture's top-left pixel inside the VI back buffer; see vi.c. */
+extern u16 *gN64FrameBuf;
+#define FB_STRIDE N64_VI_WIDTH
 extern void *__n64_oam_buf;
 static inline u8 *OamBuf(void) { return (u8 *)__n64_oam_buf; }
 
@@ -96,6 +98,25 @@ static inline u16 LocalGetWindowMask(int x, int y)
     return winout & 0x3F;
 }
 
+/* A semi-transparent sprite pixel blended with what is already there.
+ * Both are RGBA5551 in the framebuffer but the GBA's weights apply to
+ * RGB555, so it converts, blends and converts back. */
+static inline u16 BlendSpritePixel(u16 sprRGB555, u16 bgRGBA, int eva, int evb)
+{
+    u16 bgRGB555 = (u16)(((bgRGBA >> 11) & 0x1F)
+                       | (((bgRGBA >> 6) & 0x1F) << 5)
+                       | (((bgRGBA >> 1) & 0x1F) << 10));
+
+    int r = ((sprRGB555 & 0x1F) * eva + (bgRGB555 & 0x1F) * evb) / 16;
+    int g = (((sprRGB555 >> 5) & 0x1F) * eva + ((bgRGB555 >> 5) & 0x1F) * evb) / 16;
+    int b = (((sprRGB555 >> 10) & 0x1F) * eva + ((bgRGB555 >> 10) & 0x1F) * evb) / 16;
+    if (r > 31) r = 31;
+    if (g > 31) g = 31;
+    if (b > 31) b = 31;
+
+    return RGB555toRGBA5551_spr((u16)(r | (g << 5) | (b << 10)));
+}
+
 /* -----------------------------------------------------------------------
  * N64_CompositeSprites — called after N64_CompositeFrame() completes
  *
@@ -117,7 +138,7 @@ void N64_CompositeSprites(void)
     u8  *oam    = OamBuf();
     u8  *vram   = (u8 *)__n64_vram_buf;
     u16 *pltt   = (u16 *)__n64_pltt_buf;
-    u16 *fb     = gN64GBAFramebuffer;
+    u16 *fb     = gN64FrameBuf;
 
     int objVram1D = (dispcnt & DISPCNT_OBJ_1D_MAP) != 0;
 
@@ -237,9 +258,26 @@ void N64_CompositeSprites(void)
         int sx0 = (x < 0) ? -x : 0;
         int sx1 = (x + bbW > DISPLAY_WIDTH) ? DISPLAY_WIDTH - x : bbW;
 
+        /* A non-affine sprite samples its own pixels straight across, so
+         * everything that depends only on the row -- which tile row, which
+         * line inside it, where that line starts in OBJ VRAM -- is the same
+         * for all of a row's pixels. Working it out per pixel, which is what
+         * this did, was most of the cost of drawing a sprite. */
+        const int simple = (affineMode == 0);
+
         for (int sy = sy0; sy < sy1; sy++) {
             int fbY = y + sy;
-            u16 *fbRow = fb + fbY * DISPLAY_WIDTH;
+            u16 *fbRow = fb + fbY * FB_STRIDE;
+
+            const u8 *rowBase = NULL;
+            int rowSubY = 0;
+
+            if (simple) {
+                int pixY = vFlip ? (spHeight - 1 - sy) : sy;
+                rowSubY = pixY & (TILE_HEIGHT - 1);
+                rowBase = objVram
+                        + (tileNum + (pixY >> 3) * tileRowStride) * TILE_SIZE_4BPP;
+            }
 
             for (int sx = sx0; sx < sx1; sx++) {
                 int fbX = x + sx;
@@ -247,6 +285,36 @@ void N64_CompositeSprites(void)
                 /* Window check: bit 4 = OBJ visible */
                 if (windowsOn && !(LocalGetWindowMask(fbX, fbY) & (1 << 4)))
                     continue;
+
+                if (simple) {
+                    /* The row's work is already done; only the column is
+                     * left. */
+                    int pixX = hFlip ? (spWidth - 1 - sx) : sx;
+                    const u8 *tile = rowBase
+                                   + ((pixX >> 3) << bpp8) * TILE_SIZE_4BPP;
+                    int subX = pixX & (TILE_WIDTH - 1);
+
+                    int palIdx;
+                    if (bpp8) {
+                        palIdx = tile[rowSubY * 8 + subX];
+                    } else {
+                        u8 byte = tile[rowSubY * 4 + (subX >> 1)];
+                        palIdx = (subX & 1) ? (byte >> 4) : (byte & 0xF);
+                    }
+                    if (palIdx == 0)
+                        continue;
+
+                    int palEntry = bpp8 ? palIdx : (palNum * 16 + palIdx);
+
+                    if (objMode == 1 && blendEff == 1 && evb > 0) {
+                        fbRow[fbX] = BlendSpritePixel(
+                            SpritePlttRead(pltt, 256 + palEntry),
+                            fbRow[fbX], eva, evb);
+                    } else {
+                        fbRow[fbX] = sObjPal[palEntry];
+                    }
+                    continue;
+                }
 
                 /* Compute tile pixel coordinates */
                 int pixX, pixY;
