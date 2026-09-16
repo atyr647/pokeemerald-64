@@ -46,6 +46,7 @@
 
 #include "global.h"
 #include "gpu_regs.h"
+#include "scanline_effect.h"
 
 /* -----------------------------------------------------------------------
  * GPU register buffering state
@@ -150,7 +151,7 @@ extern void N64_VIPaintBorders(void);      /* vi.c              */
  * rate from the frame counter, which is worth more than the cycle counts
  * under an emulator that approximates the CPU clock.
  * --------------------------------------------------------------------- */
-#define N64_PROFILE_OVERLAY 0
+#define N64_PROFILE_OVERLAY 1
 #if N64_PROFILE_OVERLAY
 extern u16 *gN64BackBuffer;
 
@@ -161,22 +162,107 @@ static inline u32 C0Count(void)
     return c;
 }
 
-/* Paint a 32-bit value as 32 cells of 8 px, one row of the VI framebuffer.
- * White = 1, dark grey = 0, so a screenshot decodes back to the number. */
-static void ProfileBits(int row, u32 value)
+/* The overlay's geometry, shared with tools/decode_profile.py.
+ *
+ * Everything is inset from the edges of the VI frame: the VI blanks its
+ * first eight and last seven output dots, which clipped a full-width marker
+ * and threw the decoder's scale off. */
+#define OV_X0        16    /* first VI column used                     */
+#define OV_CELL       8    /* VI px per cell                           */
+#define OV_CELLS     33    /* cell 0 is the ruler, 1-32 are the bits   */
+#define OV_MARK_ROW   2    /* VI row the white marker starts  */
+#define OV_MARK_ROWS  4    /* how tall the marker is          */
+#define OV_BAND_ROW   8    /* VI row the first value band starts */
+#define OV_BAND_ROWS  4
+
+/* A white bar of known width and height at a known row. It is how the
+ * decoder finds the VI frame inside a screenshot without knowing anything
+ * about the emulator's window: the bar's ends are VI x=OV_X0 and
+ * x=OV_X0+32*OV_CELL-1, and its height is OV_MARK_ROWS rows. */
+static void ProfileMarker(void)
 {
-    u16 *fb = gN64BackBuffer + row * 4 * N64_VI_WIDTH;
-    for (int r = 0; r < 4; r++) {
+    for (int r = 0; r < OV_BAND_ROW; r++) {
+        u16 *p = gN64BackBuffer + r * N64_VI_WIDTH;
+        int white = (r >= OV_MARK_ROW && r < OV_MARK_ROW + OV_MARK_ROWS);
+        for (int i = 0; i < N64_VI_WIDTH; i++)
+            p[i] = 0x0001;
+        if (white) {
+            for (int i = 0; i < OV_CELLS * OV_CELL; i++)
+                p[OV_X0 + i] = 0xFFFF;
+        }
+    }
+}
+
+/* Cell 0 of every band is a white stripe, so the decoder finds each band's
+ * rows by looking for stripes rather than working them out from a scale --
+ * ares corrects the N64's pixel aspect and mupen64plus does not, so a
+ * vertical scale inferred from the horizontal one drifts a whole band by the
+ * bottom of the overlay. It sits inside the marker's span so that whatever
+ * an emulator crops or scales, finding the marker is enough to find it. */
+static void ProfileRuler(int band)
+{
+    u16 *fb = gN64BackBuffer + (OV_BAND_ROW + band * OV_BAND_ROWS) * N64_VI_WIDTH;
+    for (int r = 0; r < OV_BAND_ROWS; r++) {
+        u16 *p = fb + r * N64_VI_WIDTH;
+        u16 c = (r < OV_BAND_ROWS - 1) ? 0xFFFF : 0x0001;
+        for (int i = 0; i < OV_CELL; i++)
+            p[OV_X0 + i] = c;
+    }
+}
+
+/* Paint a 32-bit value as 32 cells, one band of the VI framebuffer.
+ * White = 1, dark grey = 0, so a screenshot decodes back to the number. */
+static void ProfileBits(int band, u32 value)
+{
+    u16 *fb = gN64BackBuffer + (OV_BAND_ROW + band * OV_BAND_ROWS) * N64_VI_WIDTH;
+
+    ProfileRuler(band);
+
+    for (int r = 0; r < OV_BAND_ROWS; r++) {
         u16 *p = fb + r * N64_VI_WIDTH;
         for (int bit = 0; bit < 32; bit++) {
             u16 c = (value & (1u << (31 - bit))) ? 0xFFFF : 0x2109;
-            for (int i = 0; i < 8; i++)
-                p[bit * 8 + i] = c;
+            for (int i = 0; i < OV_CELL; i++)
+                p[OV_X0 + (1 + bit) * OV_CELL + i] = c;
         }
     }
 }
 #endif
 /* -------------------------------------------------------------------- */
+
+/* TEMP: RDP viability spike.
+ *
+ * Counts how many composited frames use a feature a display-list renderer
+ * could not draw straight through: a per-scanline register effect, an
+ * affine background, a window, or an 8bpp layer. Whatever fraction that
+ * comes to is the fraction of frames that would still need the software
+ * compositor, and so the ceiling on what moving to the RDP is worth. */
+u32 gSpikeFrames, gSpikeScanline, gSpikeAffine, gSpikeWindow, gSpikeBpp8;
+
+static void SpikeSample(void)
+{
+    extern struct ScanlineEffect gScanlineEffect;
+    u16 dispcnt = _REG16(REG_OFFSET_DISPCNT);
+    int mode = dispcnt & 7;
+
+    gSpikeFrames++;
+
+    if (gScanlineEffect.state != 0)
+        gSpikeScanline++;
+    if (mode != 0)
+        gSpikeAffine++;
+    if ((dispcnt >> 13) & 3)
+        gSpikeWindow++;
+
+    static const int bgCnt[4] = { REG_OFFSET_BG0CNT, REG_OFFSET_BG1CNT,
+                                  REG_OFFSET_BG2CNT, REG_OFFSET_BG3CNT };
+    for (int i = 0; i < 4; i++) {
+        if (((dispcnt >> (8 + i)) & 1) && ((_REG16(bgCnt[i]) >> 7) & 1)) {
+            gSpikeBpp8++;
+            break;
+        }
+    }
+}
 
 void N64_RunDeferredCompositor(void)
 {
@@ -185,10 +271,33 @@ void N64_RunDeferredCompositor(void)
     sGN64RenderPending = 0;
 
     N64_VIPaintBorders();
+    SpikeSample();
 
 #if N64_PROFILE_OVERLAY
+    /* A fixed window of game time, accumulated and then frozen.
+     *
+     * Reading one frame's cost compares nothing: the emulators run at
+     * different speeds, so a screenshot taken after the same wall-clock time
+     * catches them at different points in the intro.
+     *
+     * The window is counted in VBlanks rather than composited frames. Game
+     * logic advances once per VBlank whatever the compositor is doing, so a
+     * span of VBlanks is the same span of the same scene on both emulators;
+     * a span of composited frames is not, because the slower emulator has
+     * let more game time pass by the time it has drawn as many. Frames
+     * composited inside the window are counted separately -- that is the
+     * frame rate over a known stretch of the game. */
+    #define BENCH_FIRST  600    /* 10 s of game time, past the boot sequence */
+    #define BENCH_LAST  3600    /* through to 60 s                           */
+
+    extern volatile u32 gN64VBlankCount;
+
     static u32 sPrevEnd = 0;
-    static u32 sFrames  = 0;
+    static u32 sFrames = 0;
+    static u32 sBgTotal = 0, sSprTotal = 0, sIdleTotal = 0;
+
+    ProfileMarker();
+
     u32 t0 = C0Count();
     N64_CompositeFrame();
     u32 t1 = C0Count();
@@ -196,13 +305,26 @@ void N64_RunDeferredCompositor(void)
     u32 t2 = C0Count();
     u32 t3 = t2;
 
-    ProfileBits(0, t1 - t0);            /* backgrounds        */
-    ProfileBits(1, t2 - t1);            /* sprites            */
-    ProfileBits(2, t3 - t2);            /* blit to VI buffer  */
-    ProfileBits(3, t0 - sPrevEnd);      /* idle between frames */
-    ProfileBits(4, ++sFrames);          /* composited frames   */
+    u32 vblank = gN64VBlankCount;
+    if (vblank >= BENCH_FIRST && vblank < BENCH_LAST) {
+        sBgTotal   += t1 - t0;
+        sSprTotal  += t2 - t1;
+        sIdleTotal += t0 - sPrevEnd;
+        sFrames++;
+    }
+
+    ProfileBits(0, sBgTotal);           /* backgrounds, summed over the window */
+    ProfileBits(1, sSprTotal);          /* sprites                             */
+    ProfileBits(2, t3 - t2);            /* unused                              */
+    ProfileBits(3, sIdleTotal);         /* game logic between frames           */
+    ProfileBits(4, sFrames);            /* frames composited inside the window */
     ProfileBits(5, ((u32)_REG16(REG_OFFSET_BLDCNT) << 16)
                  | (u32)_REG16(REG_OFFSET_DISPCNT));
+    ProfileBits(6, gSpikeFrames);
+    ProfileBits(7, gSpikeScanline);
+    ProfileBits(8, gSpikeAffine);
+    ProfileBits(9, gSpikeWindow);
+    ProfileBits(10, gSpikeBpp8);
     sPrevEnd = t3;
 
     N64_VISwapBuffers();
