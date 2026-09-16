@@ -416,6 +416,7 @@
       <div class="row"><span class="key">Size</span><span class="val">16,777,216 bytes</span></div>
       <div class="row"><span class="key">SHA-1</span><span class="val">f3ae088181bf583e55daf962a92bb46f4f1d07b7</span></div>
       <div class="row"><span class="key">Produces</span><span class="val">pokeemerald64.z64 · big-endian N64 ROM</span></div>
+      <div class="row"><span class="key">And</span><span class="val">pokeemerald64.emu.z64 · same ROM, emulator boot header</span></div>
     </div>
     <p>Ruby, Sapphire, FireRed, LeafGreen and the non-US Emerald releases are different games with different data — those get refused by name rather than built into a broken ROM.</p>
   </footer>
@@ -528,57 +529,70 @@
   }
 
   /* ---------------- ZIP (the download allowlist takes .zip, not .z64) ------- */
-  async function makeZip(name, bytes) {
-    const nameBytes = new TextEncoder().encode(name);
-    const crc = crc32(bytes);
-    let body = bytes, method = 0;
+  async function deflateRaw(bytes) {
+    if (typeof CompressionStream !== "function") return null;
+    try {
+      const cs = new CompressionStream("deflate-raw");
+      const packed = new Response(new Blob([bytes]).stream().pipeThrough(cs));
+      return new Uint8Array(await packed.arrayBuffer());
+    } catch { return null; }
+  }
 
-    if (typeof CompressionStream === "function") {
-      try {
-        const cs = new CompressionStream("deflate-raw");
-        const packed = new Response(new Blob([bytes]).stream().pipeThrough(cs));
-        body = new Uint8Array(await packed.arrayBuffer());
-        method = 8;
-      } catch { body = bytes; method = 0; }
+  // entries: [{ name, bytes }, ...]
+  async function makeZip(entries) {
+    const parts = [], central = [];
+    let offset = 0;
+
+    for (const entry of entries) {
+      const nameBytes = new TextEncoder().encode(entry.name);
+      const crc = crc32(entry.bytes);
+      const packed = await deflateRaw(entry.bytes);
+      const body = packed || entry.bytes;
+      const method = packed ? 8 : 0;
+
+      const local = new DataView(new ArrayBuffer(30));
+      local.setUint32(0, 0x04034B50, true);
+      local.setUint16(4, 20, true);          // version needed
+      local.setUint16(6, 0x0800, true);      // UTF-8 name
+      local.setUint16(8, method, true);
+      local.setUint16(10, 0, true);          // mod time
+      local.setUint16(12, 0x2100, true);     // mod date (2016-08-01, fixed)
+      local.setUint32(14, crc, true);
+      local.setUint32(18, body.length, true);
+      local.setUint32(22, entry.bytes.length, true);
+      local.setUint16(26, nameBytes.length, true);
+      local.setUint16(28, 0, true);
+      parts.push(local, nameBytes, body);
+
+      const dir = new DataView(new ArrayBuffer(46));
+      dir.setUint32(0, 0x02014B50, true);
+      dir.setUint16(4, 20, true);            // version made by
+      dir.setUint16(6, 20, true);
+      dir.setUint16(8, 0x0800, true);
+      dir.setUint16(10, method, true);
+      dir.setUint16(12, 0, true);
+      dir.setUint16(14, 0x2100, true);
+      dir.setUint32(16, crc, true);
+      dir.setUint32(20, body.length, true);
+      dir.setUint32(24, entry.bytes.length, true);
+      dir.setUint16(28, nameBytes.length, true);
+      dir.setUint32(42, offset, true);       // offset of local header
+      central.push(dir, nameBytes);
+
+      offset += 30 + nameBytes.length + body.length;
     }
 
-    const local = new DataView(new ArrayBuffer(30));
-    local.setUint32(0, 0x04034B50, true);
-    local.setUint16(4, 20, true);          // version needed
-    local.setUint16(6, 0x0800, true);      // UTF-8 name
-    local.setUint16(8, method, true);
-    local.setUint16(10, 0, true);          // mod time
-    local.setUint16(12, 0x2100, true);     // mod date (2016-08-01, fixed)
-    local.setUint32(14, crc, true);
-    local.setUint32(18, body.length, true);
-    local.setUint32(22, bytes.length, true);
-    local.setUint16(26, nameBytes.length, true);
-    local.setUint16(28, 0, true);
+    const centralSize = central.reduce(
+      (n, p) => n + (p.byteLength !== undefined ? p.byteLength : p.length), 0);
 
-    const central = new DataView(new ArrayBuffer(46));
-    central.setUint32(0, 0x02014B50, true);
-    central.setUint16(4, 20, true);        // version made by
-    central.setUint16(6, 20, true);
-    central.setUint16(8, 0x0800, true);
-    central.setUint16(10, method, true);
-    central.setUint16(12, 0, true);
-    central.setUint16(14, 0x2100, true);
-    central.setUint32(16, crc, true);
-    central.setUint32(20, body.length, true);
-    central.setUint32(24, bytes.length, true);
-    central.setUint16(28, nameBytes.length, true);
-    central.setUint32(42, 0, true);        // offset of local header
-
-    const centralOffset = 30 + nameBytes.length + body.length;
     const eocd = new DataView(new ArrayBuffer(22));
     eocd.setUint32(0, 0x06054B50, true);
-    eocd.setUint16(8, 1, true);
-    eocd.setUint16(10, 1, true);
-    eocd.setUint32(12, 46 + nameBytes.length, true);
-    eocd.setUint32(16, centralOffset, true);
+    eocd.setUint16(8, entries.length, true);
+    eocd.setUint16(10, entries.length, true);
+    eocd.setUint32(12, centralSize, true);
+    eocd.setUint32(16, offset, true);        // start of central directory
 
-    return new Blob([local, nameBytes, body, central, nameBytes, eocd],
-                    { type: "application/zip" });
+    return new Blob([...parts, ...central, eocd], { type: "application/zip" });
   }
 
   /* ---------------- GBA header sniffing ---------------- */
@@ -602,7 +616,7 @@
   const EXPECT_SIZE = 16777216;
 
   const state = { rom: null, romOk: false, patch: null, head: null, out: null,
-                  dataMissing: false };
+                  emuIpl3: null, dataMissing: false };
 
   function setStage(n, s) { $("s" + n).dataset.state = s; }
   function setPill(n, cls, text) {
@@ -732,6 +746,34 @@
     refresh();
   }
 
+  /* ---------------- the emulator ROM's boot header ----------------
+   * Same game, different IPL3. The hardware ROM boots with libdragon's,
+   * which brings RDRAM up itself and is what a console and an SC64 need;
+   * mupen64plus and the cores built on it mis-read that sequence and never
+   * get started, so they want a stub that leaves RDRAM alone instead. The
+   * two ROMs are byte-identical past the 4 KB header, and the N64 checksum
+   * only covers 0x1000 onwards, so swapping the header is the whole job.
+   *
+   * The stub is laid out against a specific build's .boot section, so it
+   * cannot be assembled here and travels beside the patch. Without it the
+   * page just hands back the hardware ROM on its own. */
+  async function loadEmuIpl3() {
+    try {
+      const res = await fetch("emu-ipl3.json", { cache: "no-store" });
+      if (!res.ok) return;
+      const blob = await res.json();
+      const bytes = base64ToBytes(blob.data);
+      if (bytes.length !== blob.length) return;
+      state.emuIpl3 = { offset: blob.offset, bytes };
+    } catch { /* hardware ROM only */ }
+  }
+
+  function emulatorRom(rom, ipl3) {
+    const out = rom.slice();
+    out.set(ipl3.bytes, ipl3.offset);
+    return out;
+  }
+
   /* ---------------- stage 2: build ---------------- */
   function refresh() {
     const ready = state.romOk && state.patch;
@@ -778,7 +820,11 @@
       $("outCrc").textContent = hex8(crc32(out));
       setPill(2, "good", "Built");
       setStage(2, "done");
-      say("outMsg", "Checksum verified. Copy it to your flash cart's SD card.", "ok");
+      say("outMsg", state.emuIpl3
+            ? "Checksum verified. Saving gives you two copies: pokeemerald64.z64 " +
+              "for a console or flash cart, and pokeemerald64.emu.z64 for an " +
+              "emulator — the same game with a boot header emulators get along with."
+            : "Checksum verified. Copy it to your flash cart's SD card.", "ok");
       $("saveActions").hidden = false;
     } catch (e) {
       setPill(2, "fail", "Failed");
@@ -792,27 +838,43 @@
   /* ---------------- saving ---------------- */
   let downloads = null;
 
+  function downloadBlob(blob, filename) {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 30000);
+  }
+
   async function save() {
     if (!state.out) return;
     const btn = $("saveBtn");
     btn.disabled = true;
 
     try {
+      const entries = [{ name: "pokeemerald64.z64", bytes: state.out }];
+      if (state.emuIpl3) {
+        entries.push({ name: "pokeemerald64.emu.z64",
+                       bytes: emulatorRom(state.out, state.emuIpl3) });
+      }
+
       if (downloads) {
-        // The host's allowlist takes .zip but not .z64, so ship the ROM inside one.
-        const zip = await makeZip("pokeemerald64.z64", state.out);
+        // The host's allowlist takes .zip but not .z64, so ship the ROMs inside one.
+        const zip = await makeZip(entries);
         await downloads.save({ filename: "pokeemerald64.zip", data: zip });
-        say("outMsg", "Saved. Unzip pokeemerald64.z64 onto your flash cart.", "ok");
+        say("outMsg", entries.length > 1
+              ? "Saved. Unzip pokeemerald64.z64 for a console or flash cart, " +
+                "pokeemerald64.emu.z64 for an emulator."
+              : "Saved. Unzip pokeemerald64.z64 onto your flash cart.", "ok");
+      } else if (entries.length > 1) {
+        const zip = await makeZip(entries);
+        downloadBlob(zip, "pokeemerald64.zip");
       } else {
-        const url = URL.createObjectURL(new Blob([state.out],
-                                        { type: "application/octet-stream" }));
-        const a = document.createElement("a");
-        a.href = url;
-        a.download = "pokeemerald64.z64";
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
-        setTimeout(() => URL.revokeObjectURL(url), 30000);
+        downloadBlob(new Blob([state.out], { type: "application/octet-stream" }),
+                     "pokeemerald64.z64");
       }
     } catch (e) {
       if (e && e.code === "declined") say("outMsg", "Save cancelled — the ROM is still built, try again when ready.", "");
@@ -828,6 +890,7 @@
   $("saveBtn").addEventListener("click", save);
 
   loadConversionData();
+  loadEmuIpl3();
 
   // The save surface only exists inside the claude.ai viewer; when this page is
   // self-hosted we fall back to an ordinary download, so nothing waits on it.

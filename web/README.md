@@ -2,7 +2,8 @@
 
 A single-page, entirely client-side patcher: someone drops in their own
 Pokémon Emerald (USA) `.gba` and gets back `pokeemerald64.z64` for an
-EverDrive 64, SC64, or an emulator. The ROM never leaves the browser.
+EverDrive 64 or SC64, plus `pokeemerald64.emu.z64` for an emulator. The ROM
+never leaves the browser.
 
 `index.html` is the whole site — no build step, no dependencies, no server.
 Host it anywhere static.
@@ -39,6 +40,16 @@ python3 tools/make_bps.py \
         /path/to/pokeemerald.gba \
         build/n64/pokeemerald64.z64 \
         web/pokeemerald64.bps --stats --gzip --json
+```
+
+It also wants `emu-ipl3.json` beside it — see *Two ROMs* below:
+
+```sh
+make -f Makefile.n64 emu                   # produces …/pokeemerald64.emu.z64
+python3 tools/patch_ipl3.py \
+        --elf build/n64/pokeemerald64.elf \
+        --emit-json web/emu-ipl3.json \
+        build/n64/pokeemerald64.emu.z64
 ```
 
 `--gzip` is worth using: what the patch carries is dominated by MIPS code,
@@ -88,6 +99,26 @@ that round-trips.
 Regenerate the patch on every `.z64` rebuild — it is pinned to that exact
 output by CRC-32.
 
+## Two ROMs
+
+The page hands back the same game twice, differing only in the 4 KB boot
+header:
+
+- `pokeemerald64.z64` carries libdragon's IPL3, which initialises RDRAM the
+  way a console needs and which SC64 recognises. This is the flash cart ROM.
+- `pokeemerald64.emu.z64` carries the stub from `tools/ipl3.s`, which leaves
+  RDRAM alone. mupen64plus and the cores built on it emulate the RDRAM
+  registers by pattern-matching Nintendo's IPL3, so libdragon's derails them
+  before the game starts; doing nothing is the right procedure there, because
+  their RDRAM is a plain host buffer that works from power-on.
+
+Everything past `0x1000` is byte-identical, and the N64 checksum only covers
+`0x1000` onwards, so the page builds the second ROM by splicing the header
+from `emu-ipl3.json` into the first. That blob is laid out against a specific
+build's `.boot` section, so regenerate it whenever the `.z64` is rebuilt,
+exactly like the patch. If it is missing the page quietly falls back to
+handing back the hardware ROM on its own.
+
 ## Without a bundled patch
 
 If `pokeemerald64.bps` is missing, the page says so and offers a second drop
@@ -95,11 +126,12 @@ target for the `.bps`, so it stays usable for anyone who built their own.
 
 ## Saving the result
 
-Self-hosted, the page hands back `pokeemerald64.z64` as an ordinary download.
-Published as a claude.ai artifact, page-initiated downloads are blocked and the
-host's allowlist takes `.zip` but not `.z64`, so there the ROM is wrapped in
-`pokeemerald64.zip` (deflate, roughly 44% of the raw size) and saved through
-the `downloads` capability. Both paths produce the same bytes.
+Both ROMs travel in one `pokeemerald64.zip` (deflate, roughly 44% of the raw
+size). Self-hosted that is an ordinary download; published as a claude.ai
+artifact, page-initiated downloads are blocked and the host's allowlist takes
+`.zip` but not `.z64`, so it goes out through the `downloads` capability
+instead. Both paths produce the same bytes. With no `emu-ipl3.json` there is
+only one ROM to hand over, and self-hosted it is downloaded as a bare `.z64`.
 
 ## Checks the page makes
 

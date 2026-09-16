@@ -46,4 +46,5 @@ prefabs.json
 web/*.bps
 web/*.bps.gz
 web/*.bps.json
+web/emu-ipl3.json
 tools/__pycache__/

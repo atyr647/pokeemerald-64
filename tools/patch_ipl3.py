@@ -17,12 +17,21 @@ Usage:
       has to be findable: it defaults to the ROM's sibling .elf, which is
       where the build leaves it, and --elf points elsewhere.
 
+  python3 tools/patch_ipl3.py ... --emit-json <out.json>
+      Also writes the padded header region as base64 in a small JSON file.
+      web/index.html loads that to offer the emulator ROM next to the
+      hardware one, since it cannot assemble the stub itself.  Because the
+      blob is laid out from a specific ELF, regenerate it whenever the ROM
+      is rebuilt, exactly like the patch.
+
 Steps:
   1. Get IPL3 bytes: either assemble ipl3.s or read --bin file
   2. Verify the binary fits in 4032 bytes (0x040–0x0FFF)
   3. Patch the binary into the ROM at offset 0x040
 """
 
+import base64
+import json
 import os
 import subprocess
 import sys
@@ -125,13 +134,29 @@ def assemble_ipl3(elf_path):
             data = f.read()
     return data
 
-def patch_rom(rom_path, ipl3_bytes):
+def pad_ipl3(ipl3_bytes):
     if len(ipl3_bytes) > IPL3_SIZE:
         print(f"IPL3 too large: {len(ipl3_bytes)} > {IPL3_SIZE}")
         sys.exit(1)
-
     # Pad to exactly IPL3_SIZE with NOPs (0x00000000 = NOP in BE MIPS)
-    padded = ipl3_bytes + b'\x00' * (IPL3_SIZE - len(ipl3_bytes))
+    return ipl3_bytes + b'\x00' * (IPL3_SIZE - len(ipl3_bytes))
+
+
+def emit_json(json_path, ipl3_bytes):
+    """Write the padded header region for web/index.html to splice in."""
+    padded = pad_ipl3(ipl3_bytes)
+    with open(json_path, "w") as f:
+        json.dump({
+            "format": "ipl3+base64",
+            "offset": IPL3_OFFSET,
+            "length": IPL3_SIZE,
+            "data": base64.b64encode(padded).decode("ascii"),
+        }, f)
+    print(f"wrote {json_path} ({IPL3_SIZE} bytes at {IPL3_OFFSET:#x})")
+
+
+def patch_rom(rom_path, ipl3_bytes):
+    padded = pad_ipl3(ipl3_bytes)
 
     with open(rom_path, "r+b") as f:
         f.seek(IPL3_OFFSET)
@@ -164,8 +189,19 @@ def main():
         elf_path = args[idx + 1]
         args = args[:idx] + args[idx + 2:]
 
+    # --emit-json <file>: also drop the padded blob next to the web patch.
+    json_path = None
+    if "--emit-json" in args:
+        idx = args.index("--emit-json")
+        if idx + 1 >= len(args):
+            print("Error: --emit-json requires a file argument")
+            sys.exit(1)
+        json_path = args[idx + 1]
+        args = args[:idx] + args[idx + 2:]
+
     if not args:
-        print(f"Usage: {sys.argv[0]} [--bin <ipl3.bin>] [--elf <rom.elf>] <rom.z64>")
+        print(f"Usage: {sys.argv[0]} [--bin <ipl3.bin>] [--elf <rom.elf>] "
+              f"[--emit-json <out.json>] <rom.z64>")
         sys.exit(1)
 
     rom_path = args[0]
@@ -199,6 +235,9 @@ def main():
             print("  (libdragon IPL3 — recognized by SC64)")
 
     patch_rom(rom_path, ipl3_bytes)
+
+    if json_path:
+        emit_json(json_path, ipl3_bytes)
 
 if __name__ == "__main__":
     main()
