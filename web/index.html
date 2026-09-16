@@ -556,7 +556,7 @@
       local.setUint16(6, 0x0800, true);      // UTF-8 name
       local.setUint16(8, method, true);
       local.setUint16(10, 0, true);          // mod time
-      local.setUint16(12, 0x2100, true);     // mod date (2016-08-01, fixed)
+      local.setUint16(12, 0x5821, true);     // mod date (2024-01-01, fixed)
       local.setUint32(14, crc, true);
       local.setUint32(18, body.length, true);
       local.setUint32(22, entry.bytes.length, true);
@@ -571,7 +571,7 @@
       dir.setUint16(8, 0x0800, true);
       dir.setUint16(10, method, true);
       dir.setUint16(12, 0, true);
-      dir.setUint16(14, 0x2100, true);
+      dir.setUint16(14, 0x5821, true);
       dir.setUint32(16, crc, true);
       dir.setUint32(20, body.length, true);
       dir.setUint32(24, entry.bytes.length, true);
