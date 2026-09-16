@@ -177,43 +177,73 @@ static void BuildPaletteCache(const u16 *pltt)
     sPal8[0] = 0;
 }
 
+/* How a layer's pixels reach their destination.
+ *
+ * The compositor used to render every enabled layer into its own line
+ * buffer and then walk all four buffers again to combine them, which meant
+ * every background pixel was written once and read back once. In the common
+ * case -- no windows, no colour effect -- the layers can go straight into
+ * the framebuffer row instead, back to front, and that second pass
+ * disappears along with the line buffers it read.
+ *
+ * The mode is always a literal at the call site and the renderers are
+ * always_inline, so each instantiation compiles down to just its own store
+ * with no test of `mode` left in the inner loop. */
+#define LAYER_WRITE 0   /* store every pixel; transparent becomes 0        */
+#define LAYER_BASE  1   /* store every pixel; transparent becomes `fill`   */
+#define LAYER_OVER  2   /* store only opaque pixels, leaving the rest      */
+
+#define LAYER_PUT(dst, colour)                       \
+    do {                                             \
+        u16 c_ = (colour);                           \
+        if (mode == LAYER_OVER) { if (c_) (dst) = c_; } \
+        else if (mode == LAYER_BASE) (dst) = c_ ? c_ : fill; \
+        else (dst) = c_;                             \
+    } while (0)
+
 /* -----------------------------------------------------------------------
  * Text-mode (modes 0/1) scanline renderer
  * --------------------------------------------------------------------- */
-static void RenderTextLine(const BgDesc *bg, int y, u16 *out)
+static inline __attribute__((always_inline))
+void RenderTextLineImpl(const BgDesc *bg, int y, u16 *out, int mode, u16 fill)
 {
     const u8 *vram = VramBuf();
 
-    int mapW = 256 << (bg->screenSize & 1);   /* 256 or 512 px wide      */
-    int mapH = 256 << (bg->screenSize >> 1);  /* 256 or 512 px tall      */
+    /* Everything the tile loop needs that does not change across the line,
+     * lifted out of it: the loop runs thirty-odd times per layer per
+     * scanline, so its setup costs about as much as the pixels do. */
+    const int screenSize = bg->screenSize;
+    const int bpp8       = bg->bpp8;
+    const int charBase   = bg->charBase;
+    const int hOfs       = bg->hOfs;
+
+    int mapW = 256 << (screenSize & 1);   /* 256 or 512 px wide      */
+    int mapH = 256 << (screenSize >> 1);  /* 256 or 512 px tall      */
+    int mapWMask = mapW - 1;
 
     int ty  = (y + bg->vOfs) & (mapH - 1);
     int sby = ty >> 8;
     int tileY = (ty & 0xFF) >> 3;
     int rowInTile = ty & 7;
 
+    /* Which screenblock a tile falls in splits cleanly into a vertical part
+     * fixed for the whole line and a horizontal part that is either zero or
+     * the top bit of tx: 512-wide maps put screenblocks 0,1 side by side,
+     * 512-tall maps stack them, and 512x512 uses 0,1 over 2,3. */
+    int sbyPart  = (screenSize == 2) ? sby : (screenSize == 3) ? sby * 2 : 0;
+    int splitX   = screenSize & 1;
+    const u8 *mapRow = vram + bg->screenBase + sbyPart * BG_SCREEN_SIZE
+                     + tileY * 64;
+
     int x = 0;
     while (x < DISPLAY_WIDTH)
     {
-        int tx  = (x + bg->hOfs) & (mapW - 1);
-        int sbx = tx >> 8;
+        int tx  = (x + hOfs) & mapWMask;
 
-        /* Which screenblock does this tile fall in?
-         * 512-wide maps put screenblocks 0,1 side-by-side; 512-tall maps
-         * stack them; 512x512 uses 0 top-left, 1 top-right, 2 bottom-left,
-         * 3 bottom-right. */
-        int sbIndex;
-        switch (bg->screenSize) {
-            case 1:  sbIndex = sbx;          break;
-            case 2:  sbIndex = sby;          break;
-            case 3:  sbIndex = sby * 2 + sbx; break;
-            default: sbIndex = 0;            break;
-        }
-
-        int tileX = (tx & 0xFF) >> 3;
-        int entryOffset = bg->screenBase + sbIndex * BG_SCREEN_SIZE
-                        + (tileY * 32 + tileX) * 2;
-        u16 entry = __builtin_bswap16(*(const u16 *)(vram + entryOffset));
+        int entryOffset = (tx & 0xFF) >> 2;   /* tile index * 2 bytes */
+        if (splitX && (tx >> 8))
+            entryOffset += BG_SCREEN_SIZE;
+        u16 entry = __builtin_bswap16(*(const u16 *)(mapRow + entryOffset));
 
         int tileNum = entry & 0x3FF;
         int hFlip   = (entry >> 10) & 1;
@@ -225,13 +255,13 @@ static void RenderTextLine(const BgDesc *bg, int y, u16 *out)
         if (x + n > DISPLAY_WIDTH)
             n = DISPLAY_WIDTH - x;
 
-        if (bg->bpp8)
+        if (bpp8)
         {
-            const u8 *row = vram + bg->charBase + tileNum * TILE_SIZE_8BPP + py * 8;
+            const u8 *row = vram + charBase + tileNum * TILE_SIZE_8BPP + py * 8;
             for (int i = 0; i < n; i++) {
                 int sx = first + i;
                 if (hFlip) sx = 7 - sx;
-                out[x + i] = sPal8[row[sx]];
+                LAYER_PUT(out[x + i], sPal8[row[sx]]);
             }
         }
         else
@@ -239,27 +269,32 @@ static void RenderTextLine(const BgDesc *bg, int y, u16 *out)
             /* Tile rows are 4 bytes and always 4-byte aligned, so the whole
              * row comes in with one load. Big-endian: byte 0 is the top
              * byte, and within a byte the low nibble is the left pixel. */
-            const u32 *row = (const u32 *)(vram + bg->charBase
+            const u32 *row = (const u32 *)(vram + charBase
                                            + tileNum * TILE_SIZE_4BPP + py * 4);
             const u16 *pal = sPal4 + ((entry >> 12) & 0xF) * 16;
             u32 w = *row;
 
             if (n == 8 && !hFlip) {
                 /* The common case: a whole unflipped tile */
-                out[x + 0] = pal[(w >> 24) & 0xF];
-                out[x + 1] = pal[(w >> 28) & 0xF];
-                out[x + 2] = pal[(w >> 16) & 0xF];
-                out[x + 3] = pal[(w >> 20) & 0xF];
-                out[x + 4] = pal[(w >>  8) & 0xF];
-                out[x + 5] = pal[(w >> 12) & 0xF];
-                out[x + 6] = pal[(w >>  0) & 0xF];
-                out[x + 7] = pal[(w >>  4) & 0xF];
+                if (mode == LAYER_OVER && w == 0) {
+                    /* A blank tile contributes nothing when overlaying, and
+                     * blank tiles are most of what the upper layers hold. */
+                } else {
+                    LAYER_PUT(out[x + 0], pal[(w >> 24) & 0xF]);
+                    LAYER_PUT(out[x + 1], pal[(w >> 28) & 0xF]);
+                    LAYER_PUT(out[x + 2], pal[(w >> 16) & 0xF]);
+                    LAYER_PUT(out[x + 3], pal[(w >> 20) & 0xF]);
+                    LAYER_PUT(out[x + 4], pal[(w >>  8) & 0xF]);
+                    LAYER_PUT(out[x + 5], pal[(w >> 12) & 0xF]);
+                    LAYER_PUT(out[x + 6], pal[(w >>  0) & 0xF]);
+                    LAYER_PUT(out[x + 7], pal[(w >>  4) & 0xF]);
+                }
             } else {
                 for (int i = 0; i < n; i++) {
                     int sx = first + i;
                     if (hFlip) sx = 7 - sx;
                     int shift = (sx & 1) * 4 + (3 - (sx >> 1)) * 8;
-                    out[x + i] = pal[(w >> shift) & 0xF];
+                    LAYER_PUT(out[x + i], pal[(w >> shift) & 0xF]);
                 }
             }
         }
@@ -275,7 +310,8 @@ static void RenderTextLine(const BgDesc *bg, int y, u16 *out)
  * recomputing the full matrix product per pixel, and masks instead of
  * dividing -- affine map sizes are always powers of two.
  * --------------------------------------------------------------------- */
-static void RenderAffineLine(const BgDesc *bg, int y, u16 *out)
+static inline __attribute__((always_inline))
+void RenderAffineLineImpl(const BgDesc *bg, int y, u16 *out, int mode, u16 fill)
 {
     const u8 *vram = VramBuf();
 
@@ -296,15 +332,61 @@ static void RenderAffineLine(const BgDesc *bg, int y, u16 *out)
             px &= mapMask;
             py &= mapMask;
         } else if (px < 0 || px >= mapSize || py < 0 || py >= mapSize) {
-            out[x] = 0;
+            LAYER_PUT(out[x], 0);
             continue;
         }
 
         /* Affine screenblocks hold 1-byte entries and are always 8bpp */
         u8 tileNum = vram[bg->screenBase + (py >> 3) * mapTiles + (px >> 3)];
-        out[x] = sPal8[vram[bg->charBase + tileNum * TILE_SIZE_8BPP
-                            + (py & 7) * 8 + (px & 7)]];
+        LAYER_PUT(out[x], sPal8[vram[bg->charBase + tileNum * TILE_SIZE_8BPP
+                                     + (py & 7) * 8 + (px & 7)]]);
     }
+}
+
+/* -----------------------------------------------------------------------
+ * One layer's scanline, in whichever of the three destination modes the
+ * caller needs. `bgMode` picks the renderer; anything a mode does not
+ * define contributes nothing.
+ * --------------------------------------------------------------------- */
+static inline __attribute__((always_inline))
+void RenderBgLineImpl(const BgDesc *bg, int bgIdx, int bgMode, int y,
+                      u16 *out, int mode, u16 fill)
+{
+    if (bgMode == 0 || (bgMode == 1 && bgIdx < 2)) {
+        RenderTextLineImpl(bg, y, out, mode, fill);
+    } else if ((bgMode == 1 && bgIdx == 2) || bgMode == 2) {
+        RenderAffineLineImpl(bg, y, out, mode, fill);
+    } else if (bgMode == 3 && bgIdx == 2) {
+        /* Bitmap mode 3: 240x160 direct-colour (LE bytes from ROM) */
+        const u16 *src = (const u16 *)(VramBuf() + y * DISPLAY_WIDTH * 2);
+        for (int x = 0; x < DISPLAY_WIDTH; x++)
+            LAYER_PUT(out[x], RGB555toRGBA5551(__builtin_bswap16(src[x])));
+    } else if (bgMode == 4 && bgIdx == 2) {
+        /* Bitmap mode 4: 240x160 8bpp paletted */
+        int frame = (_REG16(REG_OFFSET_DISPCNT) >> 4) & 1;
+        const u8 *src = VramBuf() + frame * 0xA000 + y * DISPLAY_WIDTH;
+        for (int x = 0; x < DISPLAY_WIDTH; x++)
+            LAYER_PUT(out[x], sPal8[src[x]]);
+    } else if (mode != LAYER_OVER) {
+        for (int x = 0; x < DISPLAY_WIDTH; x++)
+            LAYER_PUT(out[x], 0);
+    }
+}
+
+static void RenderBgLineWrite(const BgDesc *bg, int bgIdx, int bgMode, int y, u16 *out)
+{
+    RenderBgLineImpl(bg, bgIdx, bgMode, y, out, LAYER_WRITE, 0);
+}
+
+static void RenderBgLineBase(const BgDesc *bg, int bgIdx, int bgMode, int y,
+                             u16 *out, u16 fill)
+{
+    RenderBgLineImpl(bg, bgIdx, bgMode, y, out, LAYER_BASE, fill);
+}
+
+static void RenderBgLineOver(const BgDesc *bg, int bgIdx, int bgMode, int y, u16 *out)
+{
+    RenderBgLineImpl(bg, bgIdx, bgMode, y, out, LAYER_OVER, 0);
 }
 
 /* RGBA5551 back to the GBA's RGB555, for the blending paths which work in
@@ -374,52 +456,70 @@ static int BuildWindowMaskRow(int y)
 
 /* -----------------------------------------------------------------------
  * Colour blend / brightness adjustment
+ *
+ * All three effects are per-channel scalings of a 5-bit value, so a 32-entry
+ * table per coefficient answers them with one load instead of a multiply,
+ * a divide and a clamp. The coefficients live in registers a scanline
+ * effect is allowed to rewrite mid-frame -- Emerald's fades do exactly that
+ * through BLDY -- so the tables are rebuilt whenever the registers move,
+ * and only then.
  * --------------------------------------------------------------------- */
-static u16 BlendColours(u16 top, u16 bot)
+static u8 sEvaTab[32], sEvbTab[32], sBriUpTab[32], sBriDownTab[32];
+static int sEffCachedAlpha = -1, sEffCachedY = -1;
+
+static void RefreshEffectTables(void)
 {
     u16 bldalpha = _REG16(REG_OFFSET_BLDALPHA);
-    int eva = bldalpha & 0x1F;
-    int evb = (bldalpha >> 8) & 0x1F;
-    if (eva > 16) eva = 16;
-    if (evb > 16) evb = 16;
+    u16 bldy     = _REG16(REG_OFFSET_BLDY) & 0x1F;
 
+    if ((int)bldalpha != sEffCachedAlpha) {
+        int eva = bldalpha & 0x1F;
+        int evb = (bldalpha >> 8) & 0x1F;
+        if (eva > 16) eva = 16;
+        if (evb > 16) evb = 16;
+        for (int v = 0; v < 32; v++) {
+            sEvaTab[v] = (u8)(v * eva / 16);
+            sEvbTab[v] = (u8)(v * evb / 16);
+        }
+        sEffCachedAlpha = bldalpha;
+    }
+
+    if ((int)bldy != sEffCachedY) {
+        int ey = bldy > 16 ? 16 : bldy;
+        for (int v = 0; v < 32; v++) {
+            int up = v + (31 - v) * ey / 16;
+            int dn = v - v * ey / 16;
+            sBriUpTab[v]   = (u8)(up > 31 ? 31 : up);
+            sBriDownTab[v] = (u8)(dn < 0 ? 0 : dn);
+        }
+        sEffCachedY = bldy;
+    }
+}
+
+static inline u16 BlendColours(u16 top, u16 bot)
+{
     /* GBA RGB555 format */
-    int r = ((top & 0x1F) * eva + (bot & 0x1F) * evb) / 16;
-    int g = (((top >> 5) & 0x1F) * eva + ((bot >> 5) & 0x1F) * evb) / 16;
-    int b = (((top >> 10) & 0x1F) * eva + ((bot >> 10) & 0x1F) * evb) / 16;
+    int r = sEvaTab[top & 0x1F]         + sEvbTab[bot & 0x1F];
+    int g = sEvaTab[(top >> 5) & 0x1F]  + sEvbTab[(bot >> 5) & 0x1F];
+    int b = sEvaTab[(top >> 10) & 0x1F] + sEvbTab[(bot >> 10) & 0x1F];
     if (r > 31) r = 31;
     if (g > 31) g = 31;
     if (b > 31) b = 31;
     return (u16)(r | (g << 5) | (b << 10));
 }
 
-static u16 BrightnessIncrease(u16 colour)
+static inline u16 BrightnessIncrease(u16 colour)
 {
-    u16 bldy = _REG16(REG_OFFSET_BLDY) & 0x1F;
-    if (bldy > 16) bldy = 16;
-    int r = (colour & 0x1F);
-    int g = ((colour >> 5) & 0x1F);
-    int b = ((colour >> 10) & 0x1F);
-    r += (31 - r) * bldy / 16;
-    g += (31 - g) * bldy / 16;
-    b += (31 - b) * bldy / 16;
-    if (r > 31) r = 31;
-    if (g > 31) g = 31;
-    if (b > 31) b = 31;
-    return (u16)(r | (g << 5) | (b << 10));
+    return (u16)(sBriUpTab[colour & 0x1F]
+               | (sBriUpTab[(colour >> 5) & 0x1F] << 5)
+               | (sBriUpTab[(colour >> 10) & 0x1F] << 10));
 }
 
-static u16 BrightnessDecrease(u16 colour)
+static inline u16 BrightnessDecrease(u16 colour)
 {
-    u16 bldy = _REG16(REG_OFFSET_BLDY) & 0x1F;
-    if (bldy > 16) bldy = 16;
-    int r = (colour & 0x1F) - (colour & 0x1F) * bldy / 16;
-    int g = ((colour >> 5) & 0x1F) - ((colour >> 5) & 0x1F) * bldy / 16;
-    int b = ((colour >> 10) & 0x1F) - ((colour >> 10) & 0x1F) * bldy / 16;
-    if (r < 0) r = 0;
-    if (g < 0) g = 0;
-    if (b < 0) b = 0;
-    return (u16)(r | (g << 5) | (b << 10));
+    return (u16)(sBriDownTab[colour & 0x1F]
+               | (sBriDownTab[(colour >> 5) & 0x1F] << 5)
+               | (sBriDownTab[(colour >> 10) & 0x1F] << 10));
 }
 
 /* -----------------------------------------------------------------------
@@ -481,12 +581,21 @@ void N64_CompositeFrame(void)
     u16 backdropRGB555 = PlttRead(pltt, 0);
     u16 backdropRGBA   = RGB555toRGBA5551(backdropRGB555);
 
-    /* Fast path: no windows and no colour effects, which is what most of
-     * the game runs in. The layer buffers are already in framebuffer
-     * format, so compositing is a back-to-front overwrite of non-zero
-     * (non-transparent) pixels with no per-pixel conversion at all. */
-    int fastPath = (blendEff == 0)
+    /* Fast path: no windows, and no colour effect that can reach anything.
+     * A non-zero BLDCNT effect with an empty target-1 mask cannot change a
+     * single pixel, and the intro spends its whole run in exactly that
+     * state, so testing the mask rather than just the effect keeps those
+     * frames out of the expensive path. */
+    int fastPath = (blendEff == 0 || tgt1Mask == 0)
                 && !((dispcnt >> 13) & 1) && !((dispcnt >> 14) & 1);
+
+    /* Back-to-front order of the enabled layers, for the fast path. */
+    int drawOrder[4], drawCount = 0;
+    for (int li = 3; li >= 0; li--) {
+        int bgIdx = layerOrder[li];
+        if (bgs[bgIdx].enabled)
+            drawOrder[drawCount++] = bgIdx;
+    }
 
     for (int y = 0; y < DISPLAY_HEIGHT; y++) {
         /* Apply per-scanline register changes (battle wave effects, etc.) */
@@ -496,54 +605,33 @@ void N64_CompositeFrame(void)
         for (int i = 0; i < 4; i++)
             ParseBgDesc(i, &bgs[i], bgMode);
 
-        int windowed = fastPath ? 0 : BuildWindowMaskRow(y);
-
-        /* Render each enabled layer's scanline into its own line buffer */
-        for (int bgIdx = 0; bgIdx < 4; bgIdx++) {
-            if (!bgs[bgIdx].enabled)
-                continue;
-
-            u16 *lb = sLine[bgIdx];
-
-            if (bgMode == 0 || (bgMode == 1 && bgIdx < 2)) {
-                RenderTextLine(&bgs[bgIdx], y, lb);
-            } else if ((bgMode == 1 && bgIdx == 2) || bgMode == 2) {
-                RenderAffineLine(&bgs[bgIdx], y, lb);
-            } else if (bgMode == 3 && bgIdx == 2) {
-                /* Bitmap mode 3: 240x160 direct-colour (LE bytes from ROM) */
-                const u16 *src = (const u16 *)(VramBuf() + y * DISPLAY_WIDTH * 2);
-                for (int x = 0; x < DISPLAY_WIDTH; x++)
-                    lb[x] = RGB555toRGBA5551(__builtin_bswap16(src[x]));
-            } else if (bgMode == 4 && bgIdx == 2) {
-                /* Bitmap mode 4: 240x160 8bpp paletted */
-                int frame = (dispcnt >> 4) & 1;
-                const u8 *src = VramBuf() + frame * 0xA000 + y * DISPLAY_WIDTH;
-                for (int x = 0; x < DISPLAY_WIDTH; x++)
-                    lb[x] = sPal8[src[x]];
-            } else {
-                memset(lb, 0, sizeof(sLine[0]));
-            }
-        }
-
         u16 *rowOut = gN64GBAFramebuffer + y * DISPLAY_WIDTH;
 
         if (fastPath) {
-            for (int x = 0; x < DISPLAY_WIDTH; x++)
-                rowOut[x] = backdropRGBA;
-
-            /* Paint back to front; a zero entry is transparent */
-            for (int li = 3; li >= 0; li--) {
-                int bgIdx = layerOrder[li];
-                if (!bgs[bgIdx].enabled)
-                    continue;
-                const u16 *lb = sLine[bgIdx];
-                for (int x = 0; x < DISPLAY_WIDTH; x++) {
-                    u16 v = lb[x];
-                    if (v)
-                        rowOut[x] = v;
+            /* Straight into the framebuffer row, back to front. The
+             * bottommost layer substitutes the backdrop for its own
+             * transparent pixels, so the row needs no separate clear. */
+            if (drawCount == 0) {
+                for (int x = 0; x < DISPLAY_WIDTH; x++)
+                    rowOut[x] = backdropRGBA;
+            } else {
+                int bgIdx = drawOrder[0];
+                RenderBgLineBase(&bgs[bgIdx], bgIdx, bgMode, y, rowOut, backdropRGBA);
+                for (int d = 1; d < drawCount; d++) {
+                    bgIdx = drawOrder[d];
+                    RenderBgLineOver(&bgs[bgIdx], bgIdx, bgMode, y, rowOut);
                 }
             }
             continue;
+        }
+
+        int windowed = BuildWindowMaskRow(y);
+        RefreshEffectTables();
+
+        /* Render each enabled layer's scanline into its own line buffer */
+        for (int bgIdx = 0; bgIdx < 4; bgIdx++) {
+            if (bgs[bgIdx].enabled)
+                RenderBgLineWrite(&bgs[bgIdx], bgIdx, bgMode, y, sLine[bgIdx]);
         }
 
         for (int x = 0; x < DISPLAY_WIDTH; x++) {

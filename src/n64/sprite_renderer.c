@@ -121,6 +121,20 @@ void N64_CompositeSprites(void)
 
     int objVram1D = (dispcnt & DISPCNT_OBJ_1D_MAP) != 0;
 
+    /* Windows are off almost all the time, and when they are the per-pixel
+     * mask lookup below re-reads six IO registers for every sprite pixel.
+     * Test once here instead. */
+    int windowsOn = ((dispcnt >> 13) & 3) != 0;
+
+    /* OBJ palette, converted to framebuffer format once per frame rather
+     * than once per opaque sprite pixel. */
+    static u16 sObjPal[256];
+    for (int i = 0; i < 256; i++)
+        sObjPal[i] = RGB555toRGBA5551_spr(SpritePlttRead(pltt, 256 + i));
+
+    /* OBJ character data lives at 0x10000 in the VRAM buffer. */
+    const u8 *objVram = vram + 0x10000;
+
     u16 bldcnt   = _REG16(REG_OFFSET_BLDCNT);
     int blendEff = (bldcnt >> 6) & 3;
     int objTgt1  = (bldcnt >> 4) & 1;   /* OBJ is blend target 1 */
@@ -216,16 +230,22 @@ void N64_CompositeSprites(void)
          * "EMERALD VERSION" banner came out with its right half as noise. */
         int tileRowStride = objVram1D ? ((spWidth / TILE_WIDTH) << bpp8) : 32;
 
-        for (int sy = 0; sy < bbH; sy++) {
-            int fbY = y + sy;
-            if (fbY < 0 || fbY >= DISPLAY_HEIGHT) continue;
+        /* Clip the sprite to the screen up front, so the inner loops do not
+         * spend a bounds test on every pixel of an edge-clipped sprite. */
+        int sy0 = (y < 0) ? -y : 0;
+        int sy1 = (y + bbH > DISPLAY_HEIGHT) ? DISPLAY_HEIGHT - y : bbH;
+        int sx0 = (x < 0) ? -x : 0;
+        int sx1 = (x + bbW > DISPLAY_WIDTH) ? DISPLAY_WIDTH - x : bbW;
 
-            for (int sx = 0; sx < bbW; sx++) {
+        for (int sy = sy0; sy < sy1; sy++) {
+            int fbY = y + sy;
+            u16 *fbRow = fb + fbY * DISPLAY_WIDTH;
+
+            for (int sx = sx0; sx < sx1; sx++) {
                 int fbX = x + sx;
-                if (fbX < 0 || fbX >= DISPLAY_WIDTH) continue;
 
                 /* Window check: bit 4 = OBJ visible */
-                if (!(LocalGetWindowMask(fbX, fbY) & (1 << 4)))
+                if (windowsOn && !(LocalGetWindowMask(fbX, fbY) & (1 << 4)))
                     continue;
 
                 /* Compute tile pixel coordinates */
@@ -252,17 +272,17 @@ void N64_CompositeSprites(void)
                 if (pixX < 0 || pixX >= spWidth || pixY < 0 || pixY >= spHeight)
                     continue;
 
-                /* Tile index within sprite */
-                int tileX = pixX / TILE_WIDTH;
-                int tileY = pixY / TILE_HEIGHT;
+                /* Tile index within sprite. pixX/pixY are known non-negative
+                 * by the test above, so these are shifts and masks rather
+                 * than the signed division the compiler would otherwise have
+                 * to emit. */
+                int tileX = (unsigned)pixX / TILE_WIDTH;
+                int tileY = (unsigned)pixY / TILE_HEIGHT;
                 int tile  = tileNum + tileY * tileRowStride + (tileX << bpp8);
 
                 /* Sub-pixel within tile */
-                int subX = pixX % TILE_WIDTH;
-                int subY = pixY % TILE_HEIGHT;
-
-                /* OBJ VRAM starts at offset 0x10000 in VRAM buffer */
-                u8 *objVram = vram + 0x10000;
+                int subX = (unsigned)pixX % TILE_WIDTH;
+                int subY = (unsigned)pixY % TILE_HEIGHT;
 
                 int palIdx;
                 if (bpp8) {
@@ -277,18 +297,15 @@ void N64_CompositeSprites(void)
                 }
 
                 /* Look up colour in OBJ palette (starts at entry 256) */
-                u16 sprColour;
-                if (bpp8)
-                    sprColour = SpritePlttRead(pltt, 256 + palIdx);
-                else
-                    sprColour = SpritePlttRead(pltt, 256 + palNum * 16 + palIdx);
+                int palEntry = bpp8 ? palIdx : (palNum * 16 + palIdx);
 
                 /* Apply blending if this sprite is in OBJ blend mode */
                 u16 finalColour;
                 if (objMode == 1 && blendEff == 1 && evb > 0) {
+                    u16 sprColour = SpritePlttRead(pltt, 256 + palEntry);
                     /* Semi-transparent sprite: blend with underlying pixel.
                      * Framebuffer pixels are native RGBA5551 (BE CPU, BE VI). */
-                    u16 bgRGBA = fb[fbY * DISPLAY_WIDTH + fbX];
+                    u16 bgRGBA = fbRow[fbX];
                     /* Convert back from RGBA5551 to RGB555 for blending */
                     u16 bgRGB555 = ((bgRGBA >> 11) & 0x1F)
                                  | (((bgRGBA >> 6) & 0x1F) << 5)
@@ -305,10 +322,10 @@ void N64_CompositeSprites(void)
                     u16 blended = (u16)(nr | (ng << 5) | (nb << 10));
                     finalColour = RGB555toRGBA5551_spr(blended);
                 } else {
-                    finalColour = RGB555toRGBA5551_spr(sprColour);
+                    finalColour = sObjPal[palEntry];
                 }
 
-                fb[fbY * DISPLAY_WIDTH + fbX] = finalColour;
+                fbRow[fbX] = finalColour;
             }
         }
     }

@@ -136,17 +136,83 @@ extern void N64_CompositeSprites(void);    /* sprite_renderer.c */
 extern void N64_BlitGBAFrame(void);        /* vi.c              */
 extern void N64_VISwapBuffers(void);       /* vi.c              */
 
+/* -----------------------------------------------------------------------
+ * Compositor profiling overlay
+ *
+ * There is no console to print to and no profiler to attach, so the timings
+ * go out the only channel that always works: the screen. Set this to 1 and
+ * each frame draws six 32-bit values as bars of black-and-white cells
+ * across the top of the VI framebuffer -- the CP0 cycle counts for the
+ * background pass, the sprite pass and the blit, the gap since the previous
+ * frame, a frame counter, and BLDCNT/DISPCNT. Screenshot it and run
+ * tools/decode_profile.py on the image to read them back.
+ *
+ * Two screenshots a known number of seconds apart also give the true frame
+ * rate from the frame counter, which is worth more than the cycle counts
+ * under an emulator that approximates the CPU clock.
+ * --------------------------------------------------------------------- */
+#define N64_PROFILE_OVERLAY 0
+#if N64_PROFILE_OVERLAY
+extern u16 *gN64BackBuffer;
+
+static inline u32 C0Count(void)
+{
+    u32 c;
+    asm volatile ("mfc0 %0, $9" : "=r"(c));
+    return c;
+}
+
+/* Paint a 32-bit value as 32 cells of 8 px, one row of the VI framebuffer.
+ * White = 1, dark grey = 0, so a screenshot decodes back to the number. */
+static void ProfileBits(int row, u32 value)
+{
+    u16 *fb = gN64BackBuffer + row * 4 * N64_VI_WIDTH;
+    for (int r = 0; r < 4; r++) {
+        u16 *p = fb + r * N64_VI_WIDTH;
+        for (int bit = 0; bit < 32; bit++) {
+            u16 c = (value & (1u << (31 - bit))) ? 0xFFFF : 0x2109;
+            for (int i = 0; i < 8; i++)
+                p[bit * 8 + i] = c;
+        }
+    }
+}
+#endif
+/* -------------------------------------------------------------------- */
+
 void N64_RunDeferredCompositor(void)
 {
     if (!sGN64RenderPending)
         return;
     sGN64RenderPending = 0;
 
+#if N64_PROFILE_OVERLAY
+    static u32 sPrevEnd = 0;
+    static u32 sFrames  = 0;
+    u32 t0 = C0Count();
+    N64_CompositeFrame();
+    u32 t1 = C0Count();
+    N64_CompositeSprites();
+    u32 t2 = C0Count();
+    N64_BlitGBAFrame();
+    u32 t3 = C0Count();
+
+    ProfileBits(0, t1 - t0);            /* backgrounds        */
+    ProfileBits(1, t2 - t1);            /* sprites            */
+    ProfileBits(2, t3 - t2);            /* blit to VI buffer  */
+    ProfileBits(3, t0 - sPrevEnd);      /* idle between frames */
+    ProfileBits(4, ++sFrames);          /* composited frames   */
+    ProfileBits(5, ((u32)_REG16(REG_OFFSET_BLDCNT) << 16)
+                 | (u32)_REG16(REG_OFFSET_DISPCNT));
+    sPrevEnd = t3;
+
+    N64_VISwapBuffers();
+#else
     /* Run the full software compositor */
     N64_CompositeFrame();
     N64_CompositeSprites();
     N64_BlitGBAFrame();
     N64_VISwapBuffers();
+#endif
 
     /* Update VCOUNT to match current VI line */
     extern volatile u16 gN64CurrentLine;

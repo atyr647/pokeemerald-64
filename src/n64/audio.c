@@ -3,11 +3,29 @@
  *
  * N64 port — Audio Interface (AI) driver + M4A low-level mixer replacement
  *
- * Strategy (from the port plan):
- *   • Keep the high-level M4A sequencer (m4a.c) — it parses song data,
- *     drives MIDI-like commands, and calls into the low-level mixer.
- *   • Replace the low-level ARM assembly mixer (m4a_1.s / SoundMain /
- *     SoundMainRAM) with a C implementation that:
+ * ---------------------------------------------------------------------
+ * THE PORT IS SILENT, AND THIS IS WHY
+ *
+ * Everything below the sequencer works: the AI is configured, double
+ * buffering runs off the AI interrupt, and MixAudioFrame() will resample
+ * and mix every active PCM and CGB channel it is given.
+ *
+ * Nothing ever gives it one. MixAudioFrame() reads its channels out of
+ * SoundInfo, which is the M4A engine's state, and the M4A engine is not in
+ * this build. The plan was to keep the high-level sequencer from src/m4a.c
+ * and replace only the ARM assembly mixer in src/m4a_1.s -- but both files
+ * are in EXCLUDED_SRCS in Makefile.n64, and what stands in for them is the
+ * block of stubs at the bottom of this file. m4aSongNumStart() does
+ * nothing, MPlayMain() does nothing, ply_note() does nothing, so no channel
+ * is ever started and every frame mixes to silence.
+ *
+ * Sound therefore needs the sequencer written, not a bug fixed: MPlayMain's
+ * per-track command walk, the ply_* command handlers, ply_note's channel
+ * allocation, TrkVolPitSet, and the envelope stepping that SoundMain does
+ * on GBA. That is the substance of m4a_1.s, in C.
+ * ---------------------------------------------------------------------
+ *
+ * What is implemented here:
  *       1. Mixes all active PCM channels into a stereo 16-bit buffer.
  *       2. Mixes the 4 CGB channels (square, noise) via software synthesis.
  *       3. Feeds the buffer to the N64 AI (Audio Interface) via DMA.

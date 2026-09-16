@@ -47,6 +47,8 @@ u16 *gN64FrontBuffer = NULL;
 /* 240×160 GBA render target — compositor fills this, then we blit to VI FB */
 u16 gN64GBAFramebuffer[DISPLAY_WIDTH * DISPLAY_HEIGHT];
 
+static void paint_borders(u16 *fb);
+
 /* -----------------------------------------------------------------------
  * N64_InitVI — configure the Video Interface for 320×240 16-bit NTSC
  * --------------------------------------------------------------------- */
@@ -173,37 +175,50 @@ void N64_VISetVCountLine(u16 line)
  * Centres the GBA picture with black letterbox/pillarbox borders.
  * --------------------------------------------------------------------- */
 /* Fill helper: write opaque black (RGBA5551 = 0x0001) to n pixels.
- * memset fills bytes; 0x0001 is not a repeated byte pattern, so we loop. */
+ * memset fills bytes; 0x0001 is not a repeated byte pattern, so this writes
+ * whole words where it can -- the borders are pixel-pair aligned. */
 static void fill_opaque_black(u16 *dst, int n)
 {
-    for (int i = 0; i < n; i++)
-        dst[i] = 0x0001u;
+    while (n > 0 && ((uintptr_t)dst & 3)) { *dst++ = 0x0001u; n--; }
+    u32 *w = (u32 *)dst;
+    while (n >= 2) { *w++ = 0x00010001u; n -= 2; }
+    dst = (u16 *)w;
+    while (n-- > 0) *dst++ = 0x0001u;
+}
+
+/* The letterbox is the same every frame, so it is painted once per buffer
+ * rather than 76,800 pixels of it being rewritten 60 times a second. */
+static void paint_borders(u16 *fb)
+{
+    fill_opaque_black(fb, N64_FB_Y_OFFSET * N64_VI_WIDTH);
+    u16 *row = fb + N64_FB_Y_OFFSET * N64_VI_WIDTH;
+    for (int y = 0; y < DISPLAY_HEIGHT; y++, row += N64_VI_WIDTH) {
+        fill_opaque_black(row, N64_FB_X_OFFSET);
+        fill_opaque_black(row + N64_FB_X_OFFSET + DISPLAY_WIDTH, N64_FB_X_OFFSET);
+    }
+    fill_opaque_black(row, N64_FB_Y_OFFSET * N64_VI_WIDTH);
 }
 
 void N64_BlitGBAFrame(void)
 {
-    const u16 *src = gN64GBAFramebuffer;
-    u16       *dst = gN64BackBuffer;
-
-    /* Top border — opaque black */
-    fill_opaque_black(dst, N64_FB_Y_OFFSET * N64_VI_WIDTH);
-    dst += N64_FB_Y_OFFSET * N64_VI_WIDTH;
-
-    for (int y = 0; y < DISPLAY_HEIGHT; y++) {
-        /* Left border */
-        fill_opaque_black(dst, N64_FB_X_OFFSET);
-        dst += N64_FB_X_OFFSET;
-
-        /* GBA scanline */
-        memcpy(dst, src, DISPLAY_WIDTH * sizeof(u16));
-        dst += DISPLAY_WIDTH;
-        src += DISPLAY_WIDTH;
-
-        /* Right border */
-        fill_opaque_black(dst, N64_FB_X_OFFSET);
-        dst += N64_FB_X_OFFSET;
+    /* Paint the letterbox on the first frame rather than in N64_InitVI():
+     * N64Main()'s boot diagnostics fill the whole framebuffer several more
+     * times after VI init, so anything laid down earlier is painted over
+     * and the borders would come up whatever colour the last DIAG left. */
+    static int bordersDone = 0;
+    if (!bordersDone) {
+        paint_borders(gN64FrontBuffer);
+        paint_borders(gN64BackBuffer);
+        bordersDone = 1;
     }
 
-    /* Bottom border — opaque black */
-    fill_opaque_black(dst, N64_FB_Y_OFFSET * N64_VI_WIDTH);
+    const u16 *src = gN64GBAFramebuffer;
+    u16       *dst = gN64BackBuffer
+                   + N64_FB_Y_OFFSET * N64_VI_WIDTH + N64_FB_X_OFFSET;
+
+    for (int y = 0; y < DISPLAY_HEIGHT; y++) {
+        memcpy(dst, src, DISPLAY_WIDTH * sizeof(u16));
+        dst += N64_VI_WIDTH;
+        src += DISPLAY_WIDTH;
+    }
 }
