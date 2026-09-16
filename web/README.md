@@ -2,7 +2,7 @@
 
 A single-page, entirely client-side patcher: someone drops in their own
 Pokémon Emerald (USA) `.gba` and gets back `pokeemerald64.z64` for an
-EverDrive 64 or SC64, plus `pokeemerald64.emu.z64` for an emulator. The ROM
+EverDrive 64 or SC64, plus `pokeemerald64-emu.z64` for an emulator. The ROM
 never leaves the browser.
 
 `index.html` is the whole site — no build step, no dependencies, no server.
@@ -45,11 +45,11 @@ python3 tools/make_bps.py \
 It also wants `emu-ipl3.json` beside it — see *Two ROMs* below:
 
 ```sh
-make -f Makefile.n64 emu                   # produces …/pokeemerald64.emu.z64
+make -f Makefile.n64 emu                   # produces …/pokeemerald64-emu.z64
 python3 tools/patch_ipl3.py \
         --elf build/n64/pokeemerald64.elf \
         --emit-json web/emu-ipl3.json \
-        build/n64/pokeemerald64.emu.z64
+        build/n64/pokeemerald64-emu.z64
 ```
 
 `--gzip` is worth using: what the patch carries is dominated by MIPS code,
@@ -106,7 +106,7 @@ header:
 
 - `pokeemerald64.z64` carries libdragon's IPL3, which initialises RDRAM the
   way a console needs and which SC64 recognises. This is the flash cart ROM.
-- `pokeemerald64.emu.z64` carries the stub from `tools/ipl3.s`, which leaves
+- `pokeemerald64-emu.z64` carries the stub from `tools/ipl3.s`, which leaves
   RDRAM alone. mupen64plus and the cores built on it emulate the RDRAM
   registers by pattern-matching Nintendo's IPL3, so libdragon's derails them
   before the game starts; doing nothing is the right procedure there, because

@@ -18,7 +18,7 @@ SHELL := /bin/bash
 FILE_NAME  := pokeemerald64
 BUILD_DIR  := build/n64
 ROM_NAME   := $(FILE_NAME).z64
-EMU_ROM    := $(FILE_NAME).emu.z64
+EMU_ROM    := $(FILE_NAME)-emu.z64
 ELF_NAME   := $(FILE_NAME).elf
 MAP_NAME   := $(FILE_NAME).map
 

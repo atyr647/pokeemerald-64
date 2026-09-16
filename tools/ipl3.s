@@ -1,7 +1,7 @@
 /*
  * tools/ipl3.s — minimal N64 IPL3 for emulators that don't need RDRAM init
  *
- * This is the IPL3 for the `*.emu.z64` build. It is NOT for real hardware.
+ * This is the IPL3 for the `*-emu.z64` build. It is NOT for real hardware.
  *
  * Real IPL3 has to bring RDRAM up itself: assign each chip a device ID,
  * enable it, and run current-control calibration. libdragon's IPL3 does all

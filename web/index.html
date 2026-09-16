@@ -416,7 +416,7 @@
       <div class="row"><span class="key">Size</span><span class="val">16,777,216 bytes</span></div>
       <div class="row"><span class="key">SHA-1</span><span class="val">f3ae088181bf583e55daf962a92bb46f4f1d07b7</span></div>
       <div class="row"><span class="key">Produces</span><span class="val">pokeemerald64.z64 · big-endian N64 ROM</span></div>
-      <div class="row"><span class="key">And</span><span class="val">pokeemerald64.emu.z64 · same ROM, emulator boot header</span></div>
+      <div class="row"><span class="key">And</span><span class="val">pokeemerald64-emu.z64 · same ROM, emulator boot header</span></div>
     </div>
     <p>Ruby, Sapphire, FireRed, LeafGreen and the non-US Emerald releases are different games with different data — those get refused by name rather than built into a broken ROM.</p>
   </footer>
@@ -822,7 +822,7 @@
       setStage(2, "done");
       say("outMsg", state.emuIpl3
             ? "Checksum verified. Saving gives you two copies: pokeemerald64.z64 " +
-              "for a console or flash cart, and pokeemerald64.emu.z64 for an " +
+              "for a console or flash cart, and pokeemerald64-emu.z64 for an " +
               "emulator — the same game with a boot header emulators get along with."
             : "Checksum verified. Copy it to your flash cart's SD card.", "ok");
       $("saveActions").hidden = false;
@@ -857,7 +857,7 @@
     try {
       const entries = [{ name: "pokeemerald64.z64", bytes: state.out }];
       if (state.emuIpl3) {
-        entries.push({ name: "pokeemerald64.emu.z64",
+        entries.push({ name: "pokeemerald64-emu.z64",
                        bytes: emulatorRom(state.out, state.emuIpl3) });
       }
 
@@ -867,7 +867,7 @@
         await downloads.save({ filename: "pokeemerald64.zip", data: zip });
         say("outMsg", entries.length > 1
               ? "Saved. Unzip pokeemerald64.z64 for a console or flash cart, " +
-                "pokeemerald64.emu.z64 for an emulator."
+                "pokeemerald64-emu.z64 for an emulator."
               : "Saved. Unzip pokeemerald64.z64 onto your flash cart.", "ok");
       } else if (entries.length > 1) {
         const zip = await makeZip(entries);
