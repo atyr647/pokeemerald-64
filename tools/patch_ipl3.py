@@ -3,13 +3,19 @@
 tools/patch_ipl3.py — Assemble ipl3.s and patch it into an N64 ROM file.
 
 Usage:
-  python3 tools/patch_ipl3.py <rom.z64>
-      Assembles tools/ipl3.s and patches it into the ROM.
-
   python3 tools/patch_ipl3.py --bin <ipl3.bin> <rom.z64>
       Uses a pre-built IPL3 binary (e.g. extracted from elite_newkind.z64
       via tools/extract_ipl3.py) instead of assembling ipl3.s.
-      This is the recommended path — libdragon's IPL3 is recognized by SC64.
+      This is what the hardware ROM uses — libdragon's IPL3 brings RDRAM
+      up itself and is recognized by SC64.
+
+  python3 tools/patch_ipl3.py [--elf <rom.elf>] <rom.z64>
+      Assembles tools/ipl3.s and patches it into the ROM.  This is the
+      emulator ROM's boot stub (see `make -f Makefile.n64 emu`); it skips
+      RDRAM init, which is what mupen64plus and its derivatives need.
+      The stub is laid out from the linked ELF's .boot section, so the ELF
+      has to be findable: it defaults to the ROM's sibling .elf, which is
+      where the build leaves it, and --elf points elsewhere.
 
 Steps:
   1. Get IPL3 bytes: either assemble ipl3.s or read --bin file
@@ -28,8 +34,63 @@ IPL3_SRC    = os.path.join(SCRIPT_DIR, "ipl3.s")
 IPL3_SIZE   = 0xFC0          # 4032 bytes — bytes 0x040–0x0FFF of ROM header
 IPL3_OFFSET = 0x040          # byte offset in ROM where IPL3 starts
 
-def assemble_ipl3():
-    """Assemble ipl3.s to a raw binary, return bytes."""
+def boot_section_layout(elf_path):
+    """Where .boot lives, read from the linked ELF.
+
+    The stub has to copy .boot out of the cartridge and jump to it, so it
+    needs that section's cartridge address, its link address and its size.
+    Reading them here rather than hardcoding them in the assembly is what
+    keeps the stub from going stale when n64.ld moves things around.
+    """
+    out = subprocess.run(
+        ["mipsel-linux-gnu-readelf", "-S", "-W", elf_path],
+        capture_output=True, text=True)
+    if out.returncode:
+        print("readelf error:", out.stderr)
+        sys.exit(1)
+
+    vma = size = None
+    for line in out.stdout.splitlines():
+        parts = line.replace("[", " ").replace("]", " ").split()
+        # e.g.  2 .boot PROGBITS 80360000 020000 000640 00 AX 0 0 32
+        if len(parts) >= 7 and parts[1] == ".boot" and parts[2] == "PROGBITS":
+            vma = int(parts[3], 16)
+            size = int(parts[5], 16)
+            break
+    if vma is None:
+        print(f"error: no .boot section in {elf_path}")
+        sys.exit(1)
+
+    # The cartridge address is the section's LMA, which readelf -S does not
+    # print; take it from the program header that loads this VMA.
+    out = subprocess.run(
+        ["mipsel-linux-gnu-readelf", "-l", "-W", elf_path],
+        capture_output=True, text=True)
+    lma = None
+    for line in out.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 5 and parts[0] == "LOAD":
+            try:
+                if int(parts[2], 16) == vma:
+                    lma = int(parts[3], 16)
+                    break
+            except ValueError:
+                continue
+    if lma is None:
+        print(f"error: no LOAD segment for .boot at {vma:#x}")
+        sys.exit(1)
+
+    # The cache loop steps 32 bytes at a time and exits on equality, so the
+    # size has to be a whole number of cache lines or it runs away.
+    size = (size + 31) & ~31
+    return lma, vma, size
+
+
+def assemble_ipl3(elf_path):
+    """Assemble ipl3.s against a given ELF's layout, return raw bytes."""
+    lma, vma, size = boot_section_layout(elf_path)
+    print(f"  .boot: cart {lma:#010x} -> {vma:#010x}, {size} bytes")
+
     with tempfile.TemporaryDirectory() as tmpdir:
         obj  = os.path.join(tmpdir, "ipl3.o")
         raw  = os.path.join(tmpdir, "ipl3.bin")
@@ -38,6 +99,9 @@ def assemble_ipl3():
         as_cmd = [
             "mipsel-linux-gnu-as",
             "-EB", "-mips3", "-mabi=32", "-G0",
+            f"--defsym=IPL3_BOOT_LMA={lma}",
+            f"--defsym=IPL3_BOOT_VMA={vma}",
+            f"--defsym=IPL3_BOOT_SIZE={size}",
             IPL3_SRC, "-o", obj
         ]
         r = subprocess.run(as_cmd, capture_output=True, text=True)
@@ -89,8 +153,19 @@ def main():
         bin_path = args[idx + 1]
         args = args[:idx] + args[idx + 2:]
 
+    # --elf <file>: layout source for the assembled stub (defaults to the
+    # ROM's sibling .elf, which is where the build leaves it).
+    elf_path = None
+    if "--elf" in args:
+        idx = args.index("--elf")
+        if idx + 1 >= len(args):
+            print("Error: --elf requires a file argument")
+            sys.exit(1)
+        elf_path = args[idx + 1]
+        args = args[:idx] + args[idx + 2:]
+
     if not args:
-        print(f"Usage: {sys.argv[0]} [--bin <ipl3.bin>] <rom.z64>")
+        print(f"Usage: {sys.argv[0]} [--bin <ipl3.bin>] [--elf <rom.elf>] <rom.z64>")
         sys.exit(1)
 
     rom_path = args[0]
@@ -106,8 +181,14 @@ def main():
             ipl3_bytes = f.read()
         print(f"Using pre-built IPL3: {bin_path} ({len(ipl3_bytes)} bytes)")
     else:
+        if elf_path is None:
+            elf_path = os.path.splitext(rom_path)[0] + ".elf"
+        if not os.path.exists(elf_path):
+            print(f"error: need the linked ELF to lay out the stub; {elf_path} not found")
+            print("       pass --elf <file> if it lives elsewhere")
+            sys.exit(1)
         print("Assembling IPL3...")
-        ipl3_bytes = assemble_ipl3()
+        ipl3_bytes = assemble_ipl3(elf_path)
         print(f"IPL3 assembled: {len(ipl3_bytes)} bytes")
 
     # Verify first instruction looks sane (should be a LUI or similar)

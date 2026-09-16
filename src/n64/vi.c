@@ -15,9 +15,9 @@
  * after each VBlank the buffers are flipped by updating VI_ORIGIN.
  *
  * Endianness note:
- *   The CPU is compiled little-endian (-EL) but N64 VI registers are
- *   big-endian.  All VI register writes use N64_HW_WR() which calls
- *   __builtin_bswap32() before writing.
+ *   The port is built big-endian (-EB), same as the VI's registers, so
+ *   N64_HW_WR() is a plain volatile 32-bit store with no swapping.  The
+ *   framebuffer is 16-bit RGBA5551 and is likewise written natively.
  */
 
 #include <string.h>
@@ -64,14 +64,38 @@ void N64_InitVI(void)
 
     /* VI_STATUS: 16-bit colour, no gamma, no divot, progressive.
      *
-     * Bits 9:8 are the AA/resample mode, and this used to be 2 -- "resample
-     * only", which still runs the VI's horizontal resampling filter and
-     * averages each output pixel with its neighbour. On a 3D game that
-     * softens edges harmlessly; on a 240x160 2D image it washes out every
-     * one-pixel feature, which read as text losing strokes -- a capital O
-     * came out looking like a C. Mode 3 point-samples instead, so what the
-     * compositor writes is what reaches the screen. */
-    VI_WR(VI_STATUS_REG,  0x00003302);
+     * Bits 9:8 are the AA/resample mode:
+     *
+     *   0  resample + anti-alias, always fetch extra lines
+     *   1  resample + anti-alias, fetch extra lines when needed
+     *   2  resample only -- every pixel treated as fully covered
+     *   3  replicate -- point sample, no interpolation at all
+     *
+     * Mode 3 is the one you want for a 2D image: it reproduces exactly
+     * what the compositor wrote. It is also unusable here, because the VI
+     * only buffers 64 pixels per line in that mode, and with a 320-pixel
+     * framebuffer scaled 2x (X_SCALE 0x200) into the standard 640-dot
+     * active area starting at dot 108 it wraps: the hardware shows source
+     * pixels 0-63, then 64 dot-pairs of black, then pixels 0-63 again, and
+     * so on across the line. The picture comes out as three narrow copies
+     * of its own left edge. angrylion reproduces this faithfully (see the
+     * `vinnglitch` path in its vi.c, armed when aa_mode is 3, the type has
+     * bit 1 set, H_START < 0x80 and X_SCALE <= 0x200), so it is hardware
+     * behaviour and not an emulator quirk -- a console does the same.
+     *
+     * Mode 2 is the fix. It reads the framebuffer raw, exactly like mode 3
+     * -- no coverage bits, no AA filter -- and only adds the horizontal
+     * resample. Since X_SCALE is exactly 0x200, that resample is a plain
+     * 2x linear upscale: even output dots are a source pixel untouched,
+     * odd ones are the average of that pixel and the next. Nothing is lost
+     * and no filter runs over the image.
+     *
+     * Modes 0 and 1 are the ones to stay away from. They take each pixel's
+     * coverage from its alpha bit plus the hidden RDRAM bits, and the
+     * compositor has no meaningful coverage to give them, so they run the
+     * AA filter over a fully-opaque image and smear one-pixel features
+     * into their neighbours. */
+    VI_WR(VI_STATUS_REG,  0x00003202);
 
     /* VI_ORIGIN: physical RDRAM address of front framebuffer */
     VI_WR(VI_ORIGIN_REG,  (u32)((uintptr_t)__fb0_start & 0x00FFFFFF));

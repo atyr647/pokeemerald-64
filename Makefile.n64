@@ -18,6 +18,7 @@ SHELL := /bin/bash
 FILE_NAME  := pokeemerald64
 BUILD_DIR  := build/n64
 ROM_NAME   := $(FILE_NAME).z64
+EMU_ROM    := $(FILE_NAME).emu.z64
 ELF_NAME   := $(FILE_NAME).elf
 MAP_NAME   := $(FILE_NAME).map
 
@@ -171,11 +172,17 @@ DATA_OBJS   := $(patsubst data/%.s, $(BUILD_DIR)/data/%.o, $(DATA_ASM_SRCS))
 ALL_OBJS    := $(C_OBJS) $(ASM_OBJS) $(DATA_OBJS)
 
 # ---------- Build rules -----------------------------------
-.PHONY: all clean rom crc-tool preproc-tool gfx-tool
+.PHONY: all clean rom emu crc-tool preproc-tool gfx-tool
 
 all: rom
 
 rom: crc-tool preproc-tool gfx-tool $(BUILD_DIR)/$(ROM_NAME)
+
+# `make -f Makefile.n64 emu` — the same ROM with a different IPL3, for
+# mupen64plus and the cores derived from it. See tools/ipl3.s for why those
+# emulators need a boot stub that leaves RDRAM alone. Everything after the
+# 4 KB header is byte-identical to the hardware ROM.
+emu: $(BUILD_DIR)/$(EMU_ROM)
 
 # Build the N64 CRC fixer tool (host native, not MIPS)
 crc-tool: $(CHKSUM64)
@@ -241,6 +248,16 @@ $(BUILD_DIR)/$(ROM_NAME): $(BUILD_DIR)/$(ELF_NAME)
 	@# Fix ROM CRC checksums (computed over ROM[0x1000..], not the IPL3 region)
 	$(CHKSUM64) $@
 	@echo "ROM built: $@ ($$(wc -c < $@) bytes)"
+
+# Emulator ROM: take the finished hardware ROM, swap in the assembled stub
+# from tools/ipl3.s, and re-run the CRC fixer (the checksum covers 0x1000
+# onwards, so it does not actually change, but the fixer is cheap and this
+# keeps the two ROMs built the same way).
+$(BUILD_DIR)/$(EMU_ROM): $(BUILD_DIR)/$(ROM_NAME) tools/ipl3.s tools/patch_ipl3.py
+	cp $< $@
+	$(PYTHON) tools/patch_ipl3.py --elf $(BUILD_DIR)/$(ELF_NAME) $@
+	$(CHKSUM64) $@
+	@echo "Emulator ROM built: $@ ($$(wc -c < $@) bytes)"
 
 # Which .rodata blobs stay in cartridge ROM instead of being copied to RDRAM.
 # See tools/n64_rodata_split.py and the .rodata.blobs note in n64.ld.

@@ -1,112 +1,96 @@
 /*
- * tools/ipl3.s — N64 IPL3 boot stub (CPU-copy)
+ * tools/ipl3.s — minimal N64 IPL3 for emulators that don't need RDRAM init
  *
- * !! FALLBACK ONLY — prefer tools/ipl3_libdragon.bin !!
+ * This is the IPL3 for the `*.emu.z64` build. It is NOT for real hardware.
  *
- * This stub does NOT initialize RDRAM, which real IPL3 is required to do
- * (assign per-chip device IDs, enable the chips, run current-control
- * calibration).  Real hardware happens to tolerate the omission, but an
- * accurate emulator will not: in ares every RDRAM access is routed through
- * RDRAM::Writable::translate() until the chips are enabled, so all writes are
- * silently dropped and all reads return 0.  The copy below therefore lands
- * nowhere, the jump at the end reaches zeroed memory, and the CPU spins in
- * NOPs forever — a permanently black screen with no other diagnostic.
+ * Real IPL3 has to bring RDRAM up itself: assign each chip a device ID,
+ * enable it, and run current-control calibration. libdragon's IPL3 does all
+ * of that, which is why the hardware ROM uses it and why this file must not
+ * replace it there — on a console (or on an accurate emulator like ares)
+ * every RDRAM access before chip enable is dropped, so the copy below would
+ * land nowhere and the jump would reach zeroed memory.
  *
- * The build only falls back to assembling this file when
- * tools/ipl3_libdragon.bin is absent (see Makefile.n64).  libdragon's IPL3
- * does full RDRAM init and is BSD-licensed, so there is no reason to use this.
+ * The HLE emulators are the mirror image. In mupen64plus and the cores
+ * derived from it, RDRAM is a plain host buffer that works from power-on and
+ * needs no initialisation at all — while its RDRAM *register* emulation is
+ * pattern-matched to Nintendo's IPL3 specifically. Two hacks in
+ * device/rdram/rdram.c drive that: it deliberately serves corrupt RDRAM
+ * between a broadcast write to RDRAM_DELAY and the next broadcast write to
+ * RDRAM_MODE (bracketing what it assumes is current calibration), and at the
+ * end it reads register s4 because "in the IPL3 procedure, at this point, the
+ * amount of detected memory can be found in s4". libdragon's IPL3 is
+ * different code that keeps different things in s4, so mupen64plus reads a
+ * nonsense size out of it (64 MB), and the boot does not survive.
  *
- * NOTE: the addresses below match the OLD layout (.boot at 0x807FC000, LMA
- * ROM[0x1048]).  n64.ld and src/n64/rom_header.s now place .boot at
- * 0x80400000 with LMA ROM[0x1000] for libdragon's compat IPL3, so this stub
- * would need updating to match before it could work again.
+ * Doing nothing is therefore the correct RDRAM procedure for those emulators,
+ * and this stub does exactly that: copy the boot section out of the cartridge
+ * and jump to it.
  *
- * The N64 PIF ROM copies bytes 0x040–0x0FFF of the cart ROM into
- * RSP IMEM (or RDRAM 0xA0000040 on some revisions) and executes it.
- * This stub:
+ * The three constants come from the linked ELF and are supplied by
+ * tools/patch_ipl3.py via --defsym, so this stub follows the linker script
+ * instead of hardcoding a layout that silently goes stale:
  *
- *   1. CPU-copies ROM[0x1048 .. 0x5048] (16 KB) → RDRAM[0x807FC000 .. 0x80800000]
- *      using word reads from KSEG1 (uncached PI bus).
- *      This places the .boot section (__n64_boot in crt0.s) at its linker VMA
- *      of 0x807FC000 so all absolute addresses and J-targets are correct.
+ *   IPL3_BOOT_LMA   cartridge address of .boot, KSEG1   (e.g. 0xB0001000)
+ *   IPL3_BOOT_VMA   where .boot is linked to run        (e.g. 0x80360000)
+ *   IPL3_BOOT_SIZE  size of .boot, rounded to 32 bytes  (e.g. 0x640)
  *
- *      PI DMA is deliberately avoided: SC64 PI DMA hangs in this early-boot
- *      context (the same symptom appears in crt0.s DMA wait loops).
- *      CPU copy at ~400 ns/word for 16 KB ≈ 6 ms — negligible.
+ * crt0.s (__n64_boot) takes over from there and copies .text, .data and the
+ * read-only blobs into RDRAM itself, so only .boot travels here.
  *
- *   2. Writes back D-cache and invalidates I-cache over [0x807FC000..0x80800000]
- *      so the CPU sees the freshly written code.
+ * The PIF copies bytes 0x040–0x0FFF of the cartridge into RSP IMEM and runs
+ * it, so this must assemble to at most 4032 bytes. It is a few dozen.
  *
- *   3. Jumps to 0x807FC000 (__n64_boot entry, VMA matches actual RDRAM location).
- *
- * Expansion pak (8 MB RDRAM) is REQUIRED: 0x807FC000 = physical 0x7FC000 = 7.98 MB.
- *
- * Register use (no ABI constraints here):
- *   $t0  cart source pointer  (KSEG1 0xB0001048 → 0xB0005048)
- *   $t1  RDRAM dest pointer   (KSEG0 0x807FC000 → 0x80800000)
- *   $t2  RDRAM end address    (0x80800000, reused for all three loops)
+ * Register use (no ABI constraints at this point):
+ *   $t0  cart source pointer, KSEG1 uncached
+ *   $t1  RDRAM destination pointer, KSEG1 uncached
+ *   $t2  end of destination range
  *   $t3  word scratch
  */
 
     .section .text
     .set    noreorder
-    .set    noat
     .globl  _start
     .align  2
 
 _start:
     /* ---------------------------------------------------------------
-     * Step 1: CPU word copy ROM[0xB0001048..0xB0005048] → RDRAM[0x807FC000..0x80800000]
+     * Copy .boot from the cartridge into RDRAM.
      *
-     * Source: KSEG1 cart address 0xB0001048 (ROM file offset 0x1048 = .boot LMA)
-     * Dest:   KSEG0 RDRAM        0x807FC000 (= .boot section VMA)
-     * Length: 16 KB = 0x4000 bytes
+     * Both pointers are KSEG1 (uncached): writing straight through to
+     * RDRAM means we do not depend on the data cache being in any
+     * particular state this early, and there is no writeback to get
+     * wrong afterwards.
      * --------------------------------------------------------------- */
-    lui     $t0, 0xB000
-    ori     $t0, $t0, 0x1048    /* $t0 = 0xB0001048 (ROM .boot LMA, KSEG1) */
-    lui     $t1, 0x807F
-    ori     $t1, $t1, 0xC000    /* $t1 = 0x807FC000 (RDRAM .boot VMA)      */
-    lui     $t2, 0x8080          /* $t2 = 0x80800000 (end = VMA + 16KB)     */
-.Lipl3_copy:
-    lw      $t3, 0($t0)          /* read word from cart ROM (KSEG1 PI bus)  */
-    sw      $t3, 0($t1)          /* write word to RDRAM (KSEG0 cached)      */
+    li      $t0, IPL3_BOOT_LMA              /* cart source, KSEG1        */
+    li      $t1, (IPL3_BOOT_VMA & ~0xE0000000) | 0xA0000000  /* dest, KSEG1 */
+    addiu   $t2, $t1, IPL3_BOOT_SIZE        /* end of destination        */
+
+.Lcopy:
+    lw      $t3, 0($t0)
     addiu   $t0, $t0, 4
+    sw      $t3, 0($t1)
     addiu   $t1, $t1, 4
-    bne     $t1, $t2, .Lipl3_copy
+    bne     $t1, $t2, .Lcopy
     nop
 
     /* ---------------------------------------------------------------
-     * Step 2: Write back D-cache over the written RDRAM region so that
-     * RDRAM (read by the I-cache refill) contains the correct bytes.
-     * CACHE 0x15 = Hit_Writeback_Invalidate_D
+     * Invalidate the instruction cache over the region we just wrote,
+     * so the first fetch comes from RDRAM rather than a stale line.
+     * CACHE 0x10 = Hit_Invalidate_I. Harmless where caches are not
+     * modelled.
      * --------------------------------------------------------------- */
-    lui     $t1, 0x807F
-    ori     $t1, $t1, 0xC000    /* 0x807FC000                              */
-    /* $t2 still = 0x80800000 */
-.Lipl3_dcache:
-    cache   0x15, 0($t1)
-    addiu   $t1, $t1, 32
-    bne     $t1, $t2, .Lipl3_dcache
-    nop
+    li      $t1, IPL3_BOOT_VMA              /* KSEG0 for the cache ops   */
+    addiu   $t2, $t1, IPL3_BOOT_SIZE
 
-    /* ---------------------------------------------------------------
-     * Step 3: Invalidate I-cache over the copied region so the CPU
-     * fetches fresh instructions from RDRAM on first execution.
-     * CACHE 0x10 = Hit_Invalidate_I
-     * --------------------------------------------------------------- */
-    lui     $t1, 0x807F
-    ori     $t1, $t1, 0xC000
-    /* $t2 still = 0x80800000 */
-.Lipl3_icache:
+.Licache:
     cache   0x10, 0($t1)
     addiu   $t1, $t1, 32
-    bne     $t1, $t2, .Lipl3_icache
+    bne     $t1, $t2, .Licache
     nop
 
     /* ---------------------------------------------------------------
-     * Step 4: Jump to __n64_boot at its VMA 0x807FC000
+     * Enter __n64_boot at its link address.
      * --------------------------------------------------------------- */
-    lui     $t0, 0x807F
-    ori     $t0, $t0, 0xC000    /* 0x807FC000 */
+    li      $t0, IPL3_BOOT_VMA
     jr      $t0
     nop
