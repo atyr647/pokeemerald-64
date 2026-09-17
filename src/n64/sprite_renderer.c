@@ -117,6 +117,15 @@ static inline u16 BlendSpritePixel(u16 sprRGB555, u16 bgRGBA, int eva, int evb)
     return RGB555toRGBA5551_spr((u16)(r | (g << 5) | (b << 10)));
 }
 
+/* One sprite pixel, skipped when the palette index is the transparent
+ * zero. `pal` is the sprite's 16-entry slice of the converted OBJ
+ * palette. */
+#define OBJ_PUT(dst, index)                          \
+    do {                                             \
+        u32 i__ = (index);                           \
+        if (i__) (dst) = pal[i__];                   \
+    } while (0)
+
 /* -----------------------------------------------------------------------
  * N64_CompositeSprites — called after N64_CompositeFrame() completes
  *
@@ -265,6 +274,14 @@ void N64_CompositeSprites(void)
          * this did, was most of the cost of drawing a sprite. */
         const int simple = (affineMode == 0);
 
+        /* The great majority of sprites are unrotated, 4bpp, unwindowed and
+         * unblended. That case can be drawn a tile row at a time -- one
+         * word holds eight pixels -- instead of working out a tile address
+         * and a nibble shift for every pixel, which is what the general
+         * path below does and what most of the sprite pass cost. */
+        const int fastObj = simple && !bpp8 && !windowsOn
+                         && !(objMode == 1 && blendEff == 1 && evb > 0);
+
         for (int sy = sy0; sy < sy1; sy++) {
             int fbY = y + sy;
             u16 *fbRow = fb + fbY * FB_STRIDE;
@@ -277,6 +294,61 @@ void N64_CompositeSprites(void)
                 rowSubY = pixY & (TILE_HEIGHT - 1);
                 rowBase = objVram
                         + (tileNum + (pixY >> 3) * tileRowStride) * TILE_SIZE_4BPP;
+            }
+
+            if (fastObj) {
+                const u16 *pal = sObjPal + palNum * 16;
+                u16 *orow = fbRow + x;
+                int sx = sx0;
+
+                while (sx < sx1) {
+                    int pixX = hFlip ? (spWidth - 1 - sx) : sx;
+                    int subX = pixX & (TILE_WIDTH - 1);
+                    u32 w = *(const u32 *)(rowBase
+                                           + (pixX >> 3) * TILE_SIZE_4BPP
+                                           + rowSubY * 4);
+
+                    /* How much of this tile the run covers: to its right
+                     * edge normally, to its left edge when flipped. */
+                    int run = hFlip ? (subX + 1) : (TILE_WIDTH - subX);
+                    if (sx + run > sx1)
+                        run = sx1 - sx;
+
+                    u16 *o = orow + sx;
+                    sx += run;
+
+                    /* Sprites are mostly empty space; a blank row of one
+                     * costs a single test. */
+                    if (w == 0)
+                        continue;
+
+                    if (run == TILE_WIDTH && !hFlip) {
+                        OBJ_PUT(o[0], (w >> 24) & 0xF);
+                        OBJ_PUT(o[1], (w >> 28) & 0xF);
+                        OBJ_PUT(o[2], (w >> 16) & 0xF);
+                        OBJ_PUT(o[3], (w >> 20) & 0xF);
+                        OBJ_PUT(o[4], (w >>  8) & 0xF);
+                        OBJ_PUT(o[5], (w >> 12) & 0xF);
+                        OBJ_PUT(o[6], (w >>  0) & 0xF);
+                        OBJ_PUT(o[7], (w >>  4) & 0xF);
+                    } else if (run == TILE_WIDTH) {
+                        OBJ_PUT(o[0], (w >>  4) & 0xF);
+                        OBJ_PUT(o[1], (w >>  0) & 0xF);
+                        OBJ_PUT(o[2], (w >> 12) & 0xF);
+                        OBJ_PUT(o[3], (w >>  8) & 0xF);
+                        OBJ_PUT(o[4], (w >> 20) & 0xF);
+                        OBJ_PUT(o[5], (w >> 16) & 0xF);
+                        OBJ_PUT(o[6], (w >> 28) & 0xF);
+                        OBJ_PUT(o[7], (w >> 24) & 0xF);
+                    } else {
+                        for (int i = 0; i < run; i++) {
+                            int px = hFlip ? (subX - i) : (subX + i);
+                            int shift = (px & 1) * 4 + (3 - (px >> 1)) * 8;
+                            OBJ_PUT(o[i], (w >> shift) & 0xF);
+                        }
+                    }
+                }
+                continue;
             }
 
             for (int sx = sx0; sx < sx1; sx++) {
