@@ -151,7 +151,7 @@ extern void N64_VIPaintBorders(void);      /* vi.c              */
  * rate from the frame counter, which is worth more than the cycle counts
  * under an emulator that approximates the CPU clock.
  * --------------------------------------------------------------------- */
-#define N64_PROFILE_OVERLAY 1
+#define N64_PROFILE_OVERLAY 0
 #if N64_PROFILE_OVERLAY
 extern u16 *gN64BackBuffer;
 
