@@ -554,6 +554,29 @@ void RenderTextBandImpl(const BgDesc *bg, int y0, int rows, int mode, u16 fill)
             const u16 *pal      = sPal4 + bank * 16;
             const u8  *tileBase = vram + charBase + tileNum * TILE_SIZE_4BPP;
 
+            /* A tile of an overlaying layer that is blank everywhere
+             * contributes nothing at all, and blank tiles are most of what
+             * the upper layers hold. Four 64-bit loads answer that for the
+             * whole tile -- MIPS III has them and a tile is 32-byte aligned
+             * -- where the row loop would ask eight times. The loads warm
+             * the same cache lines the rows below read, so the check costs
+             * nothing when the tile is not blank. */
+            if (mode == LAYER_OVER && n == 8) {
+                const u64 *q = (const u64 *)tileBase;
+                if ((q[0] | q[1] | q[2] | q[3]) == 0) {
+                    x += cols;
+                    first = 0;
+                    if (++tileX == 32) {
+                        tileX = 0;
+                        block ^= splitX;
+                        entryPtr = mapRow + block * BG_SCREEN_SIZE;
+                    } else {
+                        entryPtr += 2;
+                    }
+                    continue;
+                }
+            }
+
             /* Every row of this tile that the band needs, while its bytes
              * are in the cache. */
             for (int i = 0; i < n; i++) {
