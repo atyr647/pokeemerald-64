@@ -17,25 +17,33 @@
  *   9. Writes the final RGBA5551 pixel stream into the VI back buffer.
  *
  * Performance. This is the most expensive thing the port does -- roughly
- * three fifths of a frame -- so the shape of it is deliberate:
+ * half of a frame -- so the shape of it is deliberate:
  *
+ *   - Layers are drawn a band of eight scanlines at a time, finishing each
+ *     tile before moving on, so a tile's thirty-two bytes are read once and
+ *     used eight times instead of being fetched again for every line.
  *   - Layers go straight into the VI back buffer, back to front, rather
- *     than into per-layer line buffers that a second pass reads back.
- *   - Whole unflipped tiles of an overlaying layer go out as four pixel
- *     pairs through a per-palette-bank table, with a class byte saying
- *     whether a pair can be stored whole, skipped, or has to go one pixel
- *     at a time. Blank tiles, which are most of what the upper layers
- *     hold, cost one test.
- *   - Flipped tiles get their own unrolled case. They are about a quarter
- *     of what a scene draws, and running them through the ragged per-pixel
+ *     than into per-layer line buffers that a second pass reads back. Only
+ *     a window or a colour effect needs those, and that path has its own
+ *     shortcuts.
+ *   - Whole tiles go out as four pixel pairs through a per-palette-bank
+ *     table, whatever the layer and whether or not the scroll offset put
+ *     them on a word boundary. Whether a pair can be stored whole is read
+ *     off the RGBA5551 alpha bits of the table entry rather than a second
+ *     table. Blank tiles, which are most of what the upper layers hold,
+ *     cost one test.
+ *   - Flipped tiles get their own unrolled case. They are about a sixth of
+ *     what a scene draws, and running them through the ragged per-pixel
  *     path cost more than every unflipped tile put together.
  *   - The tilemap is walked with a pointer instead of deriving each
  *     entry's address from x, and the leading partial tile is the only one
  *     that needs any offset arithmetic.
  *
- * What is left is about five instructions per pixel per layer. Going
- * materially below that means not drawing four layers in software at all,
- * which is what the RDP is for.
+ * What is left is about four instructions per pixel per layer, and ares --
+ * which models the VR4300's caches -- puts about half the remaining time
+ * in memory stalls rather than instructions. Going materially below this
+ * means not drawing four layers in software at all, which is what the RDP
+ * is for.
  */
 
 #include <string.h>
@@ -830,14 +838,19 @@ static int BuildWindowMaskRow(int y)
         }
     }
 
-    for (int x = 0; x < DISPLAY_WIDTH; x++) {
-        if (x >= x0a && x < x0b)
-            sWinMaskRow[x] = in0Mask;
-        else if (x >= x1a && x < x1b)
-            sWinMaskRow[x] = in1Mask;
-        else
-            sWinMaskRow[x] = outMask;
-    }
+    /* Three flat runs, not two hundred and forty comparisons: outside
+     * everywhere, then window 1, then window 0 over the top -- which is the
+     * priority the per-pixel version had. */
+    memset(sWinMaskRow, outMask, DISPLAY_WIDTH);
+
+    if (x1b > DISPLAY_WIDTH) x1b = DISPLAY_WIDTH;
+    if (x1b > x1a)
+        memset(sWinMaskRow + x1a, in1Mask, (size_t)(x1b - x1a));
+
+    if (x0b > DISPLAY_WIDTH) x0b = DISPLAY_WIDTH;
+    if (x0b > x0a)
+        memset(sWinMaskRow + x0a, in0Mask, (size_t)(x0b - x0a));
+
     return 1;
 }
 
