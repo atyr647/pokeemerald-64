@@ -360,7 +360,16 @@ void EmitTileRow4(u16 *o, u32 w, const u16 *pal,
             PAIR_BASE(q, 2, p2, fp);
             PAIR_BASE(q, 3, p3, fp);
         }
-    } else if (mode != LAYER_WRITE && n == 8 && !hFlip) {
+    } else if (mode == LAYER_WRITE && n == 8 && !hFlip && !(((uintptr_t)o) & 3)) {
+        /* A layer going to its own line buffer, on the windowed path: every
+         * pixel is stored, transparent ones as zero, so the four pairs need
+         * no test at all. This is the cheapest the loop ever gets. */
+        u32 *q = (u32 *)o;
+        q[0] = bankPairs[(w >> 24) & 0xFF];
+        q[1] = bankPairs[(w >> 16) & 0xFF];
+        q[2] = bankPairs[(w >>  8) & 0xFF];
+        q[3] = bankPairs[w & 0xFF];
+    } else if (n == 8 && !hFlip) {
         /* The same tile, landing half a pixel out. A scroll offset with an
          * odd low bit puts every tile of the line on an odd halfword, which
          * used to drop the whole line onto the eight-store path below --
@@ -383,7 +392,8 @@ void EmitTileRow4(u16 *o, u32 w, const u16 *pal,
             u16 lead = (u16)(P0 >> 16);
             u16 tail = (u16)P3;
 
-            if (((P0 & P1 & P2 & P3) & PAIR_BOTH) == PAIR_BOTH) {
+            if (mode == LAYER_WRITE
+                || ((P0 & P1 & P2 & P3) & PAIR_BOTH) == PAIR_BOTH) {
                 o[0] = lead;
                 q[0] = c1;
                 q[1] = c2;
@@ -403,20 +413,6 @@ void EmitTileRow4(u16 *o, u32 w, const u16 *pal,
                 PAIR_OVER(q, o, 1, 2, c3);
                 if (tail) o[7] = tail;
             }
-        }
-    } else if (n == 8 && !hFlip) {
-        /* A whole unflipped tile with no table to draw it from. */
-        if (mode == LAYER_OVER && w == 0) {
-            /* blank tile, nothing to overlay */
-        } else {
-            LAYER_PUT(o[0], pal[(w >> 24) & 0xF]);
-            LAYER_PUT(o[1], pal[(w >> 28) & 0xF]);
-            LAYER_PUT(o[2], pal[(w >> 16) & 0xF]);
-            LAYER_PUT(o[3], pal[(w >> 20) & 0xF]);
-            LAYER_PUT(o[4], pal[(w >>  8) & 0xF]);
-            LAYER_PUT(o[5], pal[(w >> 12) & 0xF]);
-            LAYER_PUT(o[6], pal[(w >>  0) & 0xF]);
-            LAYER_PUT(o[7], pal[(w >>  4) & 0xF]);
         }
     } else if (n == 8 && hFlip) {
         /* A whole flipped tile. Flipped tiles are a quarter of everything a
@@ -529,7 +525,7 @@ void RenderTextLineImpl(const BgDesc *bg, int y, u16 *out, int mode, u16 fill)
                                    + tileNum * TILE_SIZE_4BPP + py * 4);
             int bank = (entry >> 12) & 0xF;
 
-            if (mode != LAYER_WRITE && bank != lastBank) {
+            if (bank != lastBank) {
                 lastBank = bank;
                 if (!(sPairBuilt & (1u << bank)))
                     BuildPairBank(bank);
@@ -626,7 +622,7 @@ void RenderTextBandImpl(const BgDesc *bg, int y0, int rows, int mode, u16 fill)
             if (x + cols > DISPLAY_WIDTH)
                 cols = DISPLAY_WIDTH - x;
 
-            if (mode != LAYER_WRITE && bank != lastBank) {
+            if (bank != lastBank) {
                 lastBank = bank;
                 if (!(sPairBuilt & (1u << bank)))
                     BuildPairBank(bank);
@@ -1017,6 +1013,17 @@ void N64_CompositeFrame(void)
         return;
     }
 
+    /* The windowed path walks the layers for every pixel of every line, so
+     * the list it walks is built once: the enabled layers, front to back.
+     * Only an alpha blend needs to look past the topmost of them. */
+    int frontOrder[4], frontCount = 0;
+    for (int li = 0; li < 4; li++) {
+        int bgIdx = layerOrder[li];
+        if (bgs[bgIdx].enabled)
+            frontOrder[frontCount++] = bgIdx;
+    }
+    const int needBot = (blendEff == 1);
+
     for (int y = 0; y < DISPLAY_HEIGHT; y++) {
         /* Apply per-scanline register changes (battle wave effects, etc.) */
         ScanlineEffect_ApplyLine(y);
@@ -1057,56 +1064,67 @@ void N64_CompositeFrame(void)
         for (int x = 0; x < DISPLAY_WIDTH; x++) {
             u16 winMask = windowed ? sWinMaskRow[x] : 0x3F;
 
-            /* Composite layers from front to back */
-            u16 topColour  = backdropRGB555;  /* fallback = backdrop       */
-            u16 botColour  = backdropRGB555;
-            int topLayer   = -1;              /* -1 = backdrop              */
-            int botLayer   = -1;
-            int gotTop     = 0;
-            int gotBot     = 0;
+            /* Front to back until the topmost opaque layer, and one further
+             * only when an alpha blend needs what is underneath. */
+            u16 topRaw   = backdropRGBA;
+            u16 botRaw   = backdropRGBA;
+            int topLayer = -1;                /* -1 = backdrop              */
+            int botLayer = -1;
+            int gotTop   = 0;
 
-            for (int li = 0; li < 4 && !gotBot; li++) {
-                int bgIdx = layerOrder[li];
+            for (int li = 0; li < frontCount; li++) {
+                int bgIdx = frontOrder[li];
 
-                if (!bgs[bgIdx].enabled) continue;
                 if (!(winMask & (1 << bgIdx))) continue;
 
                 u16 v = sLine[bgIdx][x];
                 if (!v) continue;
 
-                u16 colour = RGBA5551toRGB555(v);
                 if (!gotTop) {
-                    topColour = colour;
-                    topLayer  = bgIdx;
-                    gotTop    = 1;
+                    topRaw   = v;
+                    topLayer = bgIdx;
+                    gotTop   = 1;
+                    if (!needBot)
+                        break;
                 } else {
-                    botColour = colour;
-                    botLayer  = bgIdx;
-                    gotBot    = 1;
+                    botRaw   = v;
+                    botLayer = bgIdx;
+                    break;
                 }
             }
 
-            /* Apply colour effects. Bit 5 of the window mask is the
-             * colour-special-effect enable: a window can exempt what it
-             * covers from the blend or brightness pass. The main menu
-             * relies on that to darken everything except the highlighted
-             * entry, which without this came out uniformly grey. */
-            u16 finalColour = topColour;
-            if (!(winMask & 0x20))
-            {
-                /* effect disabled here */
-            } else if (blendEff == 1 && gotTop &&
-                (tgt1Mask & (topLayer < 0 ? 0x20 : (1 << topLayer))) &&
-                (tgt2Mask & (botLayer < 0 ? 0x20 : (1 << botLayer))))
-            {
-                finalColour = BlendColours(topColour, botColour);
-            } else if (blendEff == 2 &&
-                (tgt1Mask & (topLayer < 0 ? 0x20 : (1 << topLayer))))
-            {
+            /* Bit 5 of the window mask is the colour-special-effect enable:
+             * a window can exempt what it covers from the blend or
+             * brightness pass. The main menu relies on that to darken
+             * everything except the highlighted entry, which without this
+             * came out uniformly grey.
+             *
+             * Nothing to apply is the common case even here, and the layer
+             * values are already in framebuffer format -- so the round trip
+             * through RGB555 only happens where an effect really fires. */
+            if (blendEff == 0 || !(winMask & 0x20)) {
+                rowOut[x] = topRaw;
+                continue;
+            }
+
+            u16 tgt1Bit = (u16)(topLayer < 0 ? 0x20 : (1 << topLayer));
+            if (!(tgt1Mask & tgt1Bit)) {
+                rowOut[x] = topRaw;
+                continue;
+            }
+
+            u16 topColour = RGBA5551toRGB555(topRaw);
+            u16 finalColour;
+            if (blendEff == 1) {
+                u16 tgt2Bit = (u16)(botLayer < 0 ? 0x20 : (1 << botLayer));
+                if (!gotTop || !(tgt2Mask & tgt2Bit)) {
+                    rowOut[x] = topRaw;
+                    continue;
+                }
+                finalColour = BlendColours(topColour, RGBA5551toRGB555(botRaw));
+            } else if (blendEff == 2) {
                 finalColour = BrightnessIncrease(topColour);
-            } else if (blendEff == 3 &&
-                (tgt1Mask & (topLayer < 0 ? 0x20 : (1 << topLayer))))
-            {
+            } else {
                 finalColour = BrightnessDecrease(topColour);
             }
 
