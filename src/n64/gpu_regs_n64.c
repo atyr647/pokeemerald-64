@@ -325,6 +325,28 @@ void N64_RunDeferredCompositor(void)
     ProfileBits(8, gSpikeAffine);
     ProfileBits(9, gSpikeWindow);
     ProfileBits(10, gSpikeBpp8);
+    /* Clock calibration: 100,000 iterations of a three-instruction loop, so
+     * 300,000 instructions with no memory traffic at all. Divided into the
+     * counts reported, it gives each emulator's counts-per-instruction, which
+     * is what makes their numbers comparable -- and the gap between that and
+     * the cost of real code is the memory stalls. */
+    {
+        /* Once, not per frame: the loop is 300,000 instructions and running
+         * it every frame took a tenth off the frame rate it was measuring. */
+        static u32 sCalib = 0;
+        if (sCalib == 0) {
+            u32 c0 = C0Count();
+            asm volatile(
+                "li    $8, 100000\n"
+                "1:\n"
+                "addiu $8, $8, -1\n"
+                "bnez  $8, 1b\n"
+                "nop\n"
+                ::: "$8", "memory");
+            sCalib = C0Count() - c0;
+        }
+        ProfileBits(11, sCalib);
+    }
     sPrevEnd = t3;
 
     N64_VISwapBuffers();

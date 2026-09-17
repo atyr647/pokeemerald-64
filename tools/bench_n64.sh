@@ -25,7 +25,7 @@ set -u
 LABEL="${1:-run}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="${BENCH_OUT:-/tmp/bench_n64}"
-LABELS="bg,spr,unused,idle,frames,regs,spike_frames,spike_scanline,spike_affine,spike_window,spike_bpp8"
+LABELS="bg,spr,unused,idle,frames,regs,spike_frames,spike_scanline,spike_affine,spike_window,spike_bpp8,calib300k"
 
 mkdir -p "$OUT"
 
@@ -35,9 +35,9 @@ mkdir -p "$OUT"
 echo "===== $LABEL"
 read_one() {
     python3 "$ROOT/tools/decode_profile.py" --labels "$LABELS" "$1" 2>/dev/null | awk '
-        /^  bg /{bg=$2} /^  spr /{spr=$2} /^  idle /{id=$2} /^  frames /{f=$2}
+        /^  bg /{bg=$2} /^  spr /{spr=$2} /^  idle /{id=$2} /^  frames /{f=$2} /^  calib300k /{cal=$2}
         END { if (f == "" || bg == "") print "decode failed";
-              else printf "frames=%-6s bg=%-13s spr=%-12s idle=%s\n", f, bg, spr, id }'
+              else printf "frames=%-6s bg=%-13s spr=%-12s idle=%-12s calib=%s\n", f, bg, spr, id, cal }'
 }
 printf "%-22s " "mupen64plus+angrylion"; read_one "$OUT/mupen/shot.png"
 printf "%-22s " "ares"                 ; read_one "$OUT/ares/shot.png"

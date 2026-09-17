@@ -41,6 +41,7 @@
 #include <string.h>
 #include "global.h"
 #include "n64/defines.h"
+#include "scanline_effect.h"
 
 /* -----------------------------------------------------------------------
  * External framebuffer (declared in vi.c)
@@ -255,14 +256,14 @@ static void BuildPaletteCache(const u16 *pltt)
 
 /* One pixel pair of an overlaying layer: store it whole when both pixels
  * are opaque, drop it when neither is, otherwise one at a time. */
-#define PAIR_OVER(o, out, x, i, cls, pairval)                               \
+#define PAIR_OVER(q, o, x, i, cls, pairval)                                 \
     do {                                                                    \
         u32 c__ = (cls);                                                    \
-        if (c__ == 1) { (o)[i] = (pairval); }                               \
+        if (c__ == 1) { (q)[i] = (pairval); }                               \
         else if (c__) {                                                     \
             u32 p__ = (pairval);                                            \
-            if (p__ >> 16)     (out)[(x) + (i) * 2 + 0] = (u16)(p__ >> 16); \
-            if (p__ & 0xFFFFu) (out)[(x) + (i) * 2 + 1] = (u16)p__;         \
+            if (p__ >> 16)     (o)[(x) + (i) * 2 + 0] = (u16)(p__ >> 16);   \
+            if (p__ & 0xFFFFu) (o)[(x) + (i) * 2 + 1] = (u16)p__;           \
         }                                                                   \
     } while (0)
 
@@ -273,6 +274,92 @@ static void BuildPaletteCache(const u16 *pltt)
         else if (mode == LAYER_BASE) (dst) = c_ ? c_ : fill; \
         else (dst) = c_;                             \
     } while (0)
+
+/* -----------------------------------------------------------------------
+ * One 4bpp tile row, emitted into the framebuffer
+ *
+ * Shared by the two renderers below: the per-scanline one, and the
+ * tile-major one that draws eight rows of a tile before moving on. `o`
+ * points at the first pixel, `first` is which pixel of the tile it is, and
+ * `n` how many of them there are.
+ * --------------------------------------------------------------------- */
+static inline __attribute__((always_inline))
+void EmitTileRow4(u16 *o, u32 w, const u16 *pal,
+                  const u32 *bankPairs, const u8 *bankCls,
+                  int first, int n, int hFlip, int mode, u16 fill)
+{
+    if (mode == LAYER_OVER && n == 8 && !hFlip && !(((uintptr_t)o) & 3)) {
+        /* The hot case: an unflipped tile of an overlaying layer landing on
+         * a word boundary, so it goes out as four pixel pairs. Whether it is
+         * word-aligned is fixed for a whole line by the scroll offset, so
+         * the test predicts perfectly. */
+        if (w == 0) {
+            /* A blank tile contributes nothing when overlaying, and blank
+             * tiles are most of what the upper layers hold. */
+        } else {
+            u32 *q = (u32 *)o;
+            u32 b0 = (w >> 24) & 0xFF, b1 = (w >> 16) & 0xFF;
+            u32 b2 = (w >>  8) & 0xFF, b3 = w & 0xFF;
+            u32 c0 = bankCls[b0], c1 = bankCls[b1];
+            u32 c2 = bankCls[b2], c3 = bankCls[b3];
+
+            /* A fully opaque tile is the common case and skips the per-pair
+             * tests entirely. */
+            if ((c0 & c1 & c2 & c3) == 1) {
+                q[0] = bankPairs[b0];
+                q[1] = bankPairs[b1];
+                q[2] = bankPairs[b2];
+                q[3] = bankPairs[b3];
+            } else {
+                PAIR_OVER(q, o, 0, 0, c0, bankPairs[b0]);
+                PAIR_OVER(q, o, 0, 1, c1, bankPairs[b1]);
+                PAIR_OVER(q, o, 0, 2, c2, bankPairs[b2]);
+                PAIR_OVER(q, o, 0, 3, c3, bankPairs[b3]);
+            }
+        }
+    } else if (n == 8 && !hFlip) {
+        /* A whole unflipped tile: the bottom layer, which has no table of
+         * its own, or one that fell on an odd pixel. */
+        if (mode == LAYER_OVER && w == 0) {
+            /* blank tile, nothing to overlay */
+        } else {
+            LAYER_PUT(o[0], pal[(w >> 24) & 0xF]);
+            LAYER_PUT(o[1], pal[(w >> 28) & 0xF]);
+            LAYER_PUT(o[2], pal[(w >> 16) & 0xF]);
+            LAYER_PUT(o[3], pal[(w >> 20) & 0xF]);
+            LAYER_PUT(o[4], pal[(w >>  8) & 0xF]);
+            LAYER_PUT(o[5], pal[(w >> 12) & 0xF]);
+            LAYER_PUT(o[6], pal[(w >>  0) & 0xF]);
+            LAYER_PUT(o[7], pal[(w >>  4) & 0xF]);
+        }
+    } else if (n == 8 && hFlip) {
+        /* A whole flipped tile. Flipped tiles are a quarter of everything a
+         * scene draws, and sending them through the ragged path below --
+         * which works the shift out per pixel -- cost more than all the
+         * unflipped ones together. */
+        if (mode == LAYER_OVER && w == 0) {
+            /* blank tile, nothing to overlay */
+        } else {
+            LAYER_PUT(o[0], pal[(w >>  4) & 0xF]);
+            LAYER_PUT(o[1], pal[(w >>  0) & 0xF]);
+            LAYER_PUT(o[2], pal[(w >> 12) & 0xF]);
+            LAYER_PUT(o[3], pal[(w >>  8) & 0xF]);
+            LAYER_PUT(o[4], pal[(w >> 20) & 0xF]);
+            LAYER_PUT(o[5], pal[(w >> 16) & 0xF]);
+            LAYER_PUT(o[6], pal[(w >> 28) & 0xF]);
+            LAYER_PUT(o[7], pal[(w >> 24) & 0xF]);
+        }
+    } else {
+        /* A partial tile at either end of the line. Few enough of these that
+         * the per-pixel shift is not worth unrolling. */
+        for (int i = 0; i < n; i++) {
+            int sx = first + i;
+            if (hFlip) sx = 7 - sx;
+            int shift = (sx & 1) * 4 + (3 - (sx >> 1)) * 8;
+            LAYER_PUT(o[i], pal[(w >> shift) & 0xF]);
+        }
+    }
+}
 
 /* -----------------------------------------------------------------------
  * Text-mode (modes 0/1) scanline renderer
@@ -353,11 +440,9 @@ void RenderTextLineImpl(const BgDesc *bg, int y, u16 *out, int mode, u16 fill)
             /* Tile rows are 4 bytes and always 4-byte aligned, so the whole
              * row comes in with one load. Big-endian: byte 0 is the top
              * byte, and within a byte the low nibble is the left pixel. */
-            const u32 *row = (const u32 *)(vram + charBase
-                                           + tileNum * TILE_SIZE_4BPP + py * 4);
+            u32 w = *(const u32 *)(vram + charBase
+                                   + tileNum * TILE_SIZE_4BPP + py * 4);
             int bank = (entry >> 12) & 0xF;
-            const u16 *pal = sPal4 + bank * 16;
-            u32 w = *row;
 
             if (mode == LAYER_OVER && bank != lastBank) {
                 lastBank = bank;
@@ -367,99 +452,8 @@ void RenderTextLineImpl(const BgDesc *bg, int y, u16 *out, int mode, u16 fill)
                 bankCls   = sPairCls[bank];
             }
 
-
-            if (mode == LAYER_OVER && n == 8 && !hFlip && !(x & 1)) {
-                /* The hot case: an unflipped tile of an overlaying layer
-                 * landing on a word boundary, so it goes out as four pixel
-                 * pairs. Whether x is even is fixed for the whole line by
-                 * the scroll offset, so the test predicts perfectly. */
-                if (w == 0) {
-                    /* A blank tile contributes nothing when overlaying, and
-                     * blank tiles are most of what the upper layers hold. */
-                } else {
-                    const u32 *pairs = bankPairs;
-                    const u8 *cls = bankCls;
-                    u32 *o = (u32 *)(out + x);
-                    u32 b0 = (w >> 24) & 0xFF, b1 = (w >> 16) & 0xFF;
-                    u32 b2 = (w >>  8) & 0xFF, b3 = w & 0xFF;
-                    u32 c0 = cls[b0], c1 = cls[b1];
-                    u32 c2 = cls[b2], c3 = cls[b3];
-
-                    /* A fully opaque tile is the common case and skips the
-                     * per-pair tests entirely. */
-                    if ((c0 & c1 & c2 & c3) == 1) {
-                        o[0] = pairs[b0];
-                        o[1] = pairs[b1];
-                        o[2] = pairs[b2];
-                        o[3] = pairs[b3];
-                    } else {
-                        PAIR_OVER(o, out, x, 0, c0, pairs[b0]);
-                        PAIR_OVER(o, out, x, 1, c1, pairs[b1]);
-                        PAIR_OVER(o, out, x, 2, c2, pairs[b2]);
-                        PAIR_OVER(o, out, x, 3, c3, pairs[b3]);
-                    }
-                }
-            } else if (n == 8 && !hFlip) {
-                /* A whole unflipped tile: the bottom layer, which has no
-                 * table of its own, or one that fell on an odd pixel. */
-                if (mode == LAYER_OVER && w == 0) {
-                    /* blank tile, nothing to overlay */
-                } else {
-                    LAYER_PUT(out[x + 0], pal[(w >> 24) & 0xF]);
-                    LAYER_PUT(out[x + 1], pal[(w >> 28) & 0xF]);
-                    LAYER_PUT(out[x + 2], pal[(w >> 16) & 0xF]);
-                    LAYER_PUT(out[x + 3], pal[(w >> 20) & 0xF]);
-                    LAYER_PUT(out[x + 4], pal[(w >>  8) & 0xF]);
-                    LAYER_PUT(out[x + 5], pal[(w >> 12) & 0xF]);
-                    LAYER_PUT(out[x + 6], pal[(w >>  0) & 0xF]);
-                    LAYER_PUT(out[x + 7], pal[(w >>  4) & 0xF]);
-                }
-            } else if (n == 8 && hFlip) {
-                /* A whole flipped tile. Flipped tiles are a quarter of
-                 * everything this scene draws, and sending them through the
-                 * ragged path below -- which works the shift out per pixel
-                 * -- cost more than all the unflipped ones together. */
-                if (mode == LAYER_OVER && w == 0) {
-                    /* blank tile, nothing to overlay */
-                } else {
-                    LAYER_PUT(out[x + 0], pal[(w >>  4) & 0xF]);
-                    LAYER_PUT(out[x + 1], pal[(w >>  0) & 0xF]);
-                    LAYER_PUT(out[x + 2], pal[(w >> 12) & 0xF]);
-                    LAYER_PUT(out[x + 3], pal[(w >>  8) & 0xF]);
-                    LAYER_PUT(out[x + 4], pal[(w >> 20) & 0xF]);
-                    LAYER_PUT(out[x + 5], pal[(w >> 16) & 0xF]);
-                    LAYER_PUT(out[x + 6], pal[(w >> 28) & 0xF]);
-                    LAYER_PUT(out[x + 7], pal[(w >> 24) & 0xF]);
-                }
-            } else if (n == 8) {
-                /* A whole tile, but the scroll offset put it on an odd
-                 * pixel so the pairs cannot be stored as words. Straight
-                 * halfwords, still with the shifts unrolled -- working them
-                 * out per pixel the way the ragged path below does costs
-                 * twice as much, and half of all lines land here. */
-                if (mode == LAYER_OVER && w == 0) {
-                    /* blank tile, nothing to overlay */
-                } else {
-                    LAYER_PUT(out[x + 0], pal[(w >> 24) & 0xF]);
-                    LAYER_PUT(out[x + 1], pal[(w >> 28) & 0xF]);
-                    LAYER_PUT(out[x + 2], pal[(w >> 16) & 0xF]);
-                    LAYER_PUT(out[x + 3], pal[(w >> 20) & 0xF]);
-                    LAYER_PUT(out[x + 4], pal[(w >>  8) & 0xF]);
-                    LAYER_PUT(out[x + 5], pal[(w >> 12) & 0xF]);
-                    LAYER_PUT(out[x + 6], pal[(w >>  0) & 0xF]);
-                    LAYER_PUT(out[x + 7], pal[(w >>  4) & 0xF]);
-                }
-            } else {
-                /* A partial tile at either end of the line, or a flipped
-                 * one. Few enough of these that the per-pixel shift is not
-                 * worth unrolling. */
-                for (int i = 0; i < n; i++) {
-                    int sx = first + i;
-                    if (hFlip) sx = 7 - sx;
-                    int shift = (sx & 1) * 4 + (3 - (sx >> 1)) * 8;
-                    LAYER_PUT(out[x + i], pal[(w >> shift) & 0xF]);
-                }
-            }
+            EmitTileRow4(out + x, w, sPal4 + bank * 16, bankPairs, bankCls,
+                         first, n, hFlip, mode, fill);
         }
 
         x += n;
@@ -473,6 +467,126 @@ void RenderTextLineImpl(const BgDesc *bg, int y, u16 *out, int mode, u16 fill)
             entryPtr += 2;
         }
     }
+}
+
+
+/* -----------------------------------------------------------------------
+ * Text-mode renderer, tile-major
+ *
+ * The per-scanline renderer above re-reads a tile's map entry and one of
+ * its rows for every line it appears on: eight touches of the same 32-byte
+ * tile, scattered across a 16 KB charblock. On a 93.75 MHz CPU with an 8 KB
+ * data cache that is where the frame goes -- measured against ares, which
+ * models the cache, about two fifths of the background pass was memory
+ * stalls rather than instructions.
+ *
+ * This draws a band of up to eight scanlines at once, finishing each tile
+ * before moving to the next, so a tile's bytes are read once and used
+ * eight times. The writes become strided instead of sequential, but they
+ * touch the same number of framebuffer lines either way.
+ *
+ * It cannot be used when a scanline effect is running, since that rewrites
+ * the scroll registers between lines; the caller checks.
+ * --------------------------------------------------------------------- */
+static inline __attribute__((always_inline))
+void RenderTextBandImpl(const BgDesc *bg, int y0, int rows, int mode, u16 fill)
+{
+    const u8 *vram       = VramBuf();
+    const int screenSize = bg->screenSize;
+    const int charBase   = bg->charBase;
+    const int hOfs       = bg->hOfs;
+
+    int mapW     = 256 << (screenSize & 1);
+    int mapH     = 256 << (screenSize >> 1);
+    int mapWMask = mapW - 1;
+    int splitX   = screenSize & 1;
+
+    int r = 0;
+    while (r < rows)
+    {
+        /* How many of the band's remaining rows come from one tile row. */
+        int ty        = (y0 + r + bg->vOfs) & (mapH - 1);
+        int rowInTile = ty & 7;
+        int n         = 8 - rowInTile;
+        if (n > rows - r)
+            n = rows - r;
+
+        int sby     = ty >> 8;
+        int tileY   = (ty & 0xFF) >> 3;
+        int sbyPart = (screenSize == 2) ? sby : (screenSize == 3) ? sby * 2 : 0;
+        const u8 *mapRow = vram + bg->screenBase + sbyPart * BG_SCREEN_SIZE
+                         + tileY * 64;
+
+        int tx    = hOfs & mapWMask;
+        int tileX = (tx & 0xFF) >> 3;
+        int block = splitX ? (tx >> 8) : 0;
+        const u8 *entryPtr = mapRow + block * BG_SCREEN_SIZE + tileX * 2;
+        int first = tx & 7;
+
+        int lastBank = -1;
+        const u32 *bankPairs = NULL;
+        const u8  *bankCls   = NULL;
+
+        u16 *rowBase = gN64FrameBuf + (y0 + r) * FB_STRIDE;
+
+        int x = 0;
+        while (x < DISPLAY_WIDTH)
+        {
+            u16 entry = __builtin_bswap16(*(const u16 *)entryPtr);
+
+            int tileNum = entry & 0x3FF;
+            int hFlip   = (entry >> 10) & 1;
+            int vFlip   = (entry >> 11) & 1;
+            int bank    = (entry >> 12) & 0xF;
+
+            int cols = 8 - first;
+            if (x + cols > DISPLAY_WIDTH)
+                cols = DISPLAY_WIDTH - x;
+
+            if (mode == LAYER_OVER && bank != lastBank) {
+                lastBank = bank;
+                if (!(sPairBuilt & (1u << bank)))
+                    BuildPairBank(bank);
+                bankPairs = sPairs[bank];
+                bankCls   = sPairCls[bank];
+            }
+
+            const u16 *pal      = sPal4 + bank * 16;
+            const u8  *tileBase = vram + charBase + tileNum * TILE_SIZE_4BPP;
+
+            /* Every row of this tile that the band needs, while its bytes
+             * are in the cache. */
+            for (int i = 0; i < n; i++) {
+                int py = vFlip ? 7 - (rowInTile + i) : (rowInTile + i);
+                u32 w = *(const u32 *)(tileBase + py * 4);
+                EmitTileRow4(rowBase + i * FB_STRIDE + x, w, pal,
+                             bankPairs, bankCls, first, cols, hFlip, mode, fill);
+            }
+
+            x += cols;
+            first = 0;
+
+            if (++tileX == 32) {
+                tileX = 0;
+                block ^= splitX;
+                entryPtr = mapRow + block * BG_SCREEN_SIZE;
+            } else {
+                entryPtr += 2;
+            }
+        }
+
+        r += n;
+    }
+}
+
+static void RenderTextBandBase(const BgDesc *bg, int y0, int rows, u16 fill)
+{
+    RenderTextBandImpl(bg, y0, rows, LAYER_BASE, fill);
+}
+
+static void RenderTextBandOver(const BgDesc *bg, int y0, int rows)
+{
+    RenderTextBandImpl(bg, y0, rows, LAYER_OVER, 0);
 }
 
 /* -----------------------------------------------------------------------
@@ -769,6 +883,33 @@ void N64_CompositeFrame(void)
         int bgIdx = layerOrder[li];
         if (bgs[bgIdx].enabled)
             drawOrder[drawCount++] = bgIdx;
+    }
+
+    /* Tile-major needs the scroll registers to hold still for eight lines
+     * at a time and every layer to be a 4bpp text layer. That covers all but
+     * a few per cent of frames; the rest fall back to per-scanline. */
+    extern struct ScanlineEffect gScanlineEffect;
+    int bandable = fastPath && drawCount > 0 && gScanlineEffect.state == 0;
+    for (int d = 0; d < drawCount && bandable; d++) {
+        int bgIdx = drawOrder[d];
+        if (bgs[bgIdx].bpp8)
+            bandable = 0;
+        else if (!(bgMode == 0 || (bgMode == 1 && bgIdx < 2)))
+            bandable = 0;
+    }
+
+    if (bandable) {
+        for (int y = 0; y < DISPLAY_HEIGHT; y += 8) {
+            int rows = DISPLAY_HEIGHT - y;
+            if (rows > 8)
+                rows = 8;
+
+            int bgIdx = drawOrder[0];
+            RenderTextBandBase(&bgs[bgIdx], y, rows, backdropRGBA);
+            for (int d = 1; d < drawCount; d++)
+                RenderTextBandOver(&bgs[drawOrder[d]], y, rows);
+        }
+        return;
     }
 
     for (int y = 0; y < DISPLAY_HEIGHT; y++) {
