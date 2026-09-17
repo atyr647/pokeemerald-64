@@ -69,6 +69,12 @@
 #define SI_PIF_ADDR_WR64B   0x10
 #define SI_STATUS_REG       0x18
 
+/* DPC (RDP command) register offsets */
+#define DPC_START_REG       0x00
+#define DPC_END_REG         0x04
+#define DPC_CURRENT_REG     0x08
+#define DPC_STATUS_REG      0x0C
+
 /* CP0 register numbers */
 #define CP0_INDEX       0
 #define CP0_RANDOM      1

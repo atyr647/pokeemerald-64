@@ -109,6 +109,7 @@ N64_SRCS := \
     src/n64/vi.c                \
     src/n64/tile_renderer.c     \
     src/n64/sprite_renderer.c   \
+    src/n64/rdp.c               \
     src/n64/audio.c             \
     src/n64/m4a_core.c          \
     src/n64/input.c             \

@@ -136,6 +136,36 @@ extern void N64_CompositeSprites(void);    /* sprite_renderer.c */
 extern void N64_VISwapBuffers(void);       /* vi.c              */
 extern void N64_VIPaintBorders(void);      /* vi.c              */
 
+/* TEMP: RDP plumbing smoke test -- see RdpSmokeTest() below. Off by
+ * default; the real RDP work replaces pieces of the software compositor
+ * above rather than drawing alongside it. */
+#define N64_RDP_SMOKE_TEST 0
+#if N64_RDP_SMOKE_TEST
+#include "n64/rdp.h"
+
+extern u16 *gN64BackBuffer;   /* vi.c: the whole 320x240 back buffer */
+
+/* Draws one small magenta square into the corner of the picture through
+ * the RDP instead of the CPU, to prove the DPC plumbing end to end: the
+ * display list gets built, DPC_START/END gets it running, and the pixels
+ * land where the VI will actually show them. */
+static void RdpSmokeTest(void)
+{
+    const int x0 = N64_FB_X_OFFSET + DISPLAY_WIDTH  - 24;
+    const int y0 = N64_FB_Y_OFFSET + DISPLAY_HEIGHT - 24;
+    const int w  = 16, h = 16;
+
+    RDP_SetColorImage((u32)(uintptr_t)gN64BackBuffer, 0, 2, N64_VI_WIDTH);
+    RDP_SetScissor(0, 0, N64_VI_WIDTH, N64_VI_HEIGHT);
+    RDP_SetModeFill(0xF81Fu);   /* magenta, RGBA5551 */
+    RDP_FillRectangle(x0, y0, x0 + w, y0 + h);
+    RDP_Submit();
+
+    for (int row = 0; row < h; row++)
+        RDP_InvalidateDest(gN64BackBuffer + (y0 + row) * N64_VI_WIDTH + x0, w * 2);
+}
+#endif
+
 /* -----------------------------------------------------------------------
  * Compositor profiling overlay
  *
@@ -354,6 +384,9 @@ void N64_RunDeferredCompositor(void)
     /* Run the full software compositor */
     N64_CompositeFrame();
     N64_CompositeSprites();
+#if N64_RDP_SMOKE_TEST
+    RdpSmokeTest();
+#endif
     N64_VISwapBuffers();
 #endif
 

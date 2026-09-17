@@ -133,6 +133,7 @@ extern void N64_InitVI(void);   /* vi.c      */
 extern void N64_InitAI(void);   /* audio.c   */
 extern void N64_InitInput(void);/* input.c   */
 extern void N64_InitFlashRAM(void); /* flashram.c */
+extern void RDP_Init(void);     /* rdp.c     */
 
 /* -----------------------------------------------------------------------
  * N64Main — platform entry point (called from crt0.s)
@@ -288,6 +289,8 @@ void N64Main(void)
         volatile u16 *fb1 = (volatile u16*)((uintptr_t)__fb1_start | 0x20000000u);
         for (int i = 0; i < 320 * 240; i++) fb1[i] = 0x07C1;
     }
+
+    RDP_Init();
 
     N64_InitAI();
     /* BLUE = InitAI done */

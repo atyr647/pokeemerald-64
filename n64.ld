@@ -317,6 +317,18 @@ SECTIONS
         . = ALIGN(64);
     } > RDRAM
 
+    /* RDP command list. Written through its KSEG1 (uncached) alias, same as
+     * the framebuffer clears in vi.c, so a CPU store lands in RDRAM with no
+     * writeback and the RDP's own RDRAM read sees it immediately. Sits in
+     * the 20KB left above the framebuffers, below the 8MB expansion-pak
+     * ceiling -- see src/n64/rdp.c. */
+    .rdp_dlist 0x807FB000 (NOLOAD) :
+    {
+        __rdp_dlist_start = .;
+        . += 0x4000;  /* 16KB */
+        __rdp_dlist_end = .;
+    } > RDRAM
+
     /* ------------------------------------------------------------------ */
     /*  Symbols for the runtime                                            */
     /* ------------------------------------------------------------------ */

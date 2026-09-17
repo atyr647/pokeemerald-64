@@ -70,7 +70,7 @@ static void N64_SetBackBuffer(u16 *back)
  * Index_Writeback_Invalidate over all 512 lines of the VR4300's 8 KB direct
  * mapped data cache, which is cheaper than hitting the 9,600 lines the
  * framebuffer spans and does not care which of them are dirty. */
-static void N64_WritebackDCache(void)
+void N64_WritebackDCache(void)
 {
     for (u32 addr = 0x80000000u; addr < 0x80000000u + 8192u; addr += 16)
         asm volatile ("cache 0x01, 0(%0)" :: "r"(addr) : "memory");
