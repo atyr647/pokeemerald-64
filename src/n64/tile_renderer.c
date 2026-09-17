@@ -699,6 +699,174 @@ static void RenderTextBandOver(const BgDesc *bg, int y0, int rows)
 }
 
 /* -----------------------------------------------------------------------
+ * Text-mode renderer, RDP
+ *
+ * Everything RenderTextBandImpl does with cache locality, the RDP gets for
+ * free from hardware: it can draw a whole 8x8 tile in one command whatever
+ * the scroll offset, so there is no reason to walk scanlines at all --
+ * this steps tile by tile, and lets SET_SCISSOR (already clipped to the
+ * picture) throw away whatever a partial edge tile draws off-screen
+ * instead of special-casing it.
+ *
+ * A GBA 4bpp tile is a natural fit for the RDP's CI4 texture format and
+ * its own palette-bank field, and that was the first version of this --
+ * but getting a CPU-built TLUT load correctly wired to real hardware's
+ * fixed palette address without a reference implementation to check
+ * against turned into more debugging than the rest of this port
+ * combined, with results that still were not reliably right. Sidestepping
+ * the RDP's palette hardware entirely costs a small CPU-side expansion
+ * this renderer can afford: each tile is unpacked from 4bpp indices to
+ * RGBA5551 texels through sPal4 -- the exact table the CPU renderer's own
+ * pair path already trusts -- into a small scratch buffer, and that goes
+ * to the RDP as an ordinary 16bpp texture. Nothing about the RDP's
+ * palette unit is involved, so there is nothing about it to get wrong.
+ *
+ * The flip bits are applied while building that scratch buffer rather
+ * than as a negative step in TEXTURE_RECTANGLE, for the same reason: one
+ * fewer RDP-side behaviour this renderer's correctness depends on.
+ *
+ * NOT YET CORRECT -- left disabled (N64_RDP_BG 0) until it is. Text and
+ * most of a scene's tiles render right, matching the CPU path pixel for
+ * pixel, but one reproducible defect remains: a patch of tiles renders as
+ * a repeating diagonal weave instead of the right graphic, in the same
+ * screen region across unrelated scenes (the intro logo's foreground
+ * leaves, and separately the treetops on the overworld route behind the
+ * player). Ruled out so far, each verified rather than assumed:
+ *   - The per-tile cache (skipping LOAD_TILE when the same VRAM tile,
+ *     bank and flip repeat). Forcing every tile through the full reload
+ *     sequence every time, unconditionally, does not change it.
+ *   - A missing SYNC_LOAD between one tile's LOAD_TILE and the previous
+ *     tile's TEXTURE_RECTANGLE. Added (see below); did not fix it.
+ *   - The scratch buffer's address staying fixed from one tile to the
+ *     next, in case something keyed off the SET_TEXTURE_IMAGE address
+ *     rather than reading it fresh. Rotating it through four slots did
+ *     not fix it.
+ *   - A tile's command group (reload + rectangle) being split across two
+ *     display-list submissions by the auto-flush inside DlCmd(). Reserving
+ *     room for the whole group up front (RDP_Reserve) did not fix it.
+ * What is left unruled out: an actual hardware/emulator RDP pipeline
+ * hazard neither of the above addresses, or a logic bug in this file that
+ * close reading has not caught. Whichever it is, it needs either real
+ * hardware, a cycle-level RDP trace, or fresh eyes -- not another guess
+ * from this list. See the session notes for the elimination log in full.
+ * --------------------------------------------------------------------- */
+#define N64_RDP_BG 0
+#if N64_RDP_BG
+#include "n64/rdp.h"
+
+/* One tile's worth of texels, rebuilt whenever the tile drawn differs
+ * from the last one (tracked as one key: its VRAM address, palette bank
+ * and flip bits together, since all four determine the expanded pixels).
+ * -1 is not a valid key -- VRAM addresses are never negative -- so the
+ * first tile of a frame always misses. */
+static ALIGNED(8) u16 sRdpTileScratch[TILE_WIDTH * TILE_HEIGHT];
+static s32 sRdpLastTileKey = -1;
+
+static void RdpBgBeginFrame(void)
+{
+    sRdpLastTileKey = -1;
+}
+
+static u16 *BuildRdpTileScratch(const u8 *tileBase, int bank, int hFlip, int vFlip)
+{
+    u16 *scratch = sRdpTileScratch;
+    const u16 *pal = sPal4 + bank * 16;
+
+    for (int row = 0; row < TILE_HEIGHT; row++) {
+        int srcRow = vFlip ? (TILE_HEIGHT - 1 - row) : row;
+        const u8 *rowBytes = tileBase + srcRow * 4;
+        u16 *dst = scratch + row * TILE_WIDTH;
+
+        for (int col = 0; col < TILE_WIDTH; col++) {
+            int srcCol = hFlip ? (TILE_WIDTH - 1 - col) : col;
+            u8 byte = rowBytes[srcCol >> 1];
+            int nibble = (srcCol & 1) ? (byte >> 4) : (byte & 0xF);
+            dst[col] = pal[nibble];
+        }
+    }
+    return scratch;
+}
+
+static void RenderTextLayerRDP(const BgDesc *bg)
+{
+    const u8 *vram       = VramBuf();
+    const int screenSize = bg->screenSize;
+    const int charBase   = bg->charBase;
+
+    int mapW   = 256 << (screenSize & 1);
+    int mapH   = 256 << (screenSize >> 1);
+    int splitX = screenSize & 1;
+
+    /* The first column/row of tiles starts at the negative of the scroll
+     * offset's within-tile remainder, so it covers the sliver of a partly
+     * scrolled-off tile at the left/top edge; the loop runs one tile past
+     * the right/bottom edge for the same reason on the other side. Both
+     * are clipped by the scissor rather than computed exactly. */
+    int firstDstY = -(bg->vOfs & 7);
+    int firstDstX = -(bg->hOfs & 7);
+
+    for (int dstY = firstDstY; dstY < DISPLAY_HEIGHT; dstY += 8) {
+        int mapY    = (dstY + bg->vOfs) & (mapH - 1);
+        int tileY   = (mapY & 0xFF) >> 3;
+        int sby     = mapY >> 8;
+        int sbyPart = (screenSize == 2) ? sby : (screenSize == 3) ? sby * 2 : 0;
+        const u8 *mapRow = vram + bg->screenBase + sbyPart * BG_SCREEN_SIZE
+                         + tileY * 64;
+
+        for (int dstX = firstDstX; dstX < DISPLAY_WIDTH; dstX += 8) {
+            int mapX  = (dstX + bg->hOfs) & (mapW - 1);
+            int tileX = (mapX & 0xFF) >> 3;
+            int block = splitX ? (mapX >> 8) : 0;
+            const u8 *entryPtr = mapRow + block * BG_SCREEN_SIZE + tileX * 2;
+            u16 entry = __builtin_bswap16(*(const u16 *)entryPtr);
+
+            int tileNum = entry & 0x3FF;
+            int hFlip   = (entry >> 10) & 1;
+            int vFlip   = (entry >> 11) & 1;
+            int bank    = (entry >> 12) & 0xF;
+
+            const u8 *tileBase = vram + charBase + tileNum * TILE_SIZE_4BPP;
+            const u64 *q = (const u64 *)tileBase;
+            if ((q[0] | q[1] | q[2] | q[3]) == 0)
+                continue;   /* blank: the backdrop fill already covers it */
+
+            s32 key = (s32)(((uintptr_t)tileBase << 6)
+                           | (bank << 2) | (hFlip << 1) | vFlip);
+
+            /* A tile's commands -- the reload, when there is one, plus the
+             * rectangle that always follows -- must land in the same
+             * display-list batch. Reserving before either runs means the
+             * buffer can only fill up and auto-submit *between* tiles, so
+             * a reload is never split across two DPC_START/END spans with
+             * a full sync in between them: the rectangle would then be
+             * the one thing in its batch that used the texture the reload
+             * just set up, and something upstream of TMEM turned out to
+             * key off that unusual case rather than just running it. */
+            RDP_Reserve(48);
+
+            if (key != sRdpLastTileKey) {
+                sRdpLastTileKey = key;
+                u16 *scratch = BuildRdpTileScratch(tileBase, bank, hFlip, vFlip);
+                RDP_WritebackSource(scratch, TILE_WIDTH * TILE_HEIGHT * sizeof(u16));
+                /* SYNC_LOAD before overwriting TMEM: without it, nothing
+                 * guarantees the previous tile's TEXTURE_RECTANGLE has
+                 * finished reading TMEM before this LOAD_TILE starts
+                 * DMAing new texels into the same address, and the
+                 * rasterizer can catch it mid-overwrite. */
+                RDP_SyncLoad();
+                RDP_SetTextureImage((u32)(uintptr_t)scratch, 0 /* RGBA */,
+                                     2 /* 16bpp */, TILE_WIDTH);
+                RDP_SetTile(0, 0, 2, TILE_WIDTH * 2 / 8, 0, 0);
+                RDP_LoadTile(0, 0, 0, TILE_WIDTH, TILE_HEIGHT);
+            }
+
+            RDP_TextureRectangle(0, dstX, dstY, dstX + 8, dstY + 8, 0, 0);
+        }
+    }
+}
+#endif /* N64_RDP_BG */
+
+/* -----------------------------------------------------------------------
  * Affine (modes 1/2) scanline renderer
  *
  * Steps the texture coordinate by pa/pc across the line instead of
@@ -1013,6 +1181,18 @@ void N64_CompositeFrame(void)
     }
 
     if (bandable) {
+#if N64_RDP_BG
+        RdpBgBeginFrame();
+        RDP_SetColorImage((u32)(uintptr_t)gN64FrameBuf, 0, 2, N64_VI_WIDTH);
+        RDP_SetScissor(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT);
+        RDP_SetModeFill(backdropRGBA);
+        RDP_FillRectangle(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT);
+        RDP_SetModeStandard();
+        for (int d = 0; d < drawCount; d++)
+            RenderTextLayerRDP(&bgs[drawOrder[d]]);
+        RDP_Submit();
+        return;
+#else
         for (int y = 0; y < DISPLAY_HEIGHT; y += 8) {
             int rows = DISPLAY_HEIGHT - y;
             if (rows > 8)
@@ -1024,6 +1204,7 @@ void N64_CompositeFrame(void)
                 RenderTextBandOver(&bgs[drawOrder[d]], y, rows);
         }
         return;
+#endif
     }
 
     /* The windowed path walks the layers for every pixel of every line, so

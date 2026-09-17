@@ -46,6 +46,14 @@ void RDP_Init(void);
  * anything the RDP was told to write. */
 void RDP_Submit(void);
 
+/* Forces a submit first if the current half-buffer has less than `bytes`
+ * free. Call this before a group of commands that must land in the same
+ * batch -- a texture load followed by the draw that reads it, say -- so
+ * the auto-submit inside each individual command can never fall in the
+ * middle of the group. `bytes` need not be exact; padding it costs
+ * nothing but reserving too little defeats the point. */
+void RDP_Reserve(int bytes);
+
 /* -----------------------------------------------------------------------
  * Render targets and clipping
  * --------------------------------------------------------------------- */
@@ -61,6 +69,10 @@ void RDP_SetModeCopy(void);
 /* 1-cycle, texture passed through unmodified, alpha-blended over what is
  * already in the framebuffer. */
 void RDP_SetModeStandard(void);
+/* Same, but samples through the TLUT (en_tlut, tlut_type=RGBA16) instead
+ * of taking the texel as a direct colour -- what every CI4/CI8 draw needs,
+ * on top of RDP_SetModeStandard's blend and filter setup. */
+void RDP_SetModeStandardTlut(void);
 void RDP_SyncPipe(void);
 void RDP_SyncTile(void);
 void RDP_SyncLoad(void);
@@ -98,6 +110,15 @@ void RDP_LoadTlut(int tile, int first, int count);
  * RDP_SetModeCopy() first for an opaque blit or RDP_SetModeStandard() to
  * alpha-blend. */
 void RDP_TextureRectangle(int tile, int x0, int y0, int x1, int y1, int s, int t);
+
+/* The general form: an explicit starting texel and per-pixel step in each
+ * axis (s5.10 fixed point -- 1024 is one texel), so a negative step reads
+ * a tile backwards for a horizontal or vertical flip. RDP_TextureRectangle
+ * is this with the unflipped 1:1 case's steps filled in. Only valid in
+ * 1-/2-cycle mode: COPY's four-texels-per-cycle stepping does not have a
+ * sensible reverse direction. */
+void RDP_TextureRectangleXF(int tile, int x0, int y0, int x1, int y1,
+                             int s, int t, int dsdx, int dtdy);
 
 /* Writes back the CPU data cache over [addr, addr+len) unless addr is
  * already an uncached (KSEG1) alias. Every texture source the RDP reads --

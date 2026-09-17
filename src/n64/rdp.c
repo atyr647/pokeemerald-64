@@ -129,6 +129,12 @@ void RDP_Submit(void)
  * issues a triangle, whose edge/shade/texture blocks run longer). A buffer
  * that would overflow is submitted first: safe, because each command is
  * self-contained once written. */
+void RDP_Reserve(int bytes)
+{
+    if (sDlOff + (u32)bytes + 8 > DL_HALF)
+        RDP_Submit();
+}
+
 static void DlCmd(u32 w0, u32 w1)
 {
     /* Room for this command plus the SYNC_FULL that RDP_Submit() appends. */
@@ -226,6 +232,22 @@ void RDP_SetModeStandard(void)
     SetCombine(0x00887F10u, 0x88FCF279u);
 }
 
+/* Same as RDP_SetModeStandard, with en_tlut (bit 47 of the 56-bit register,
+ * bit 15 of the high word passed to SET_OTHER_MODES) also set so a CI
+ * texel is looked up through the palette instead of read as a direct
+ * colour. tlut_type (bit 46, bit 14 here) is left clear for RGBA16 --
+ * every TLUT this port builds is already-converted RGBA5551, not IA. */
+void RDP_SetModeStandardTlut(void)
+{
+    RDP_SyncPipe();
+    sCycle = CYCLE_1CYCLE;
+    u32 filt = (1u << 11) | (1u << 10);
+    u32 blend = (1u << 22) | (1u << 20);
+    u32 enTlut = (1u << 15);
+    SetOtherModes((CYCLE_1CYCLE << 20) | filt | enTlut, blend | 0x00006040u);
+    SetCombine(0x00887F10u, 0x88FCF279u);
+}
+
 void RDP_SetFillColor16(u16 rgba5551)
 {
     u32 px = rgba5551;
@@ -317,14 +339,13 @@ void RDP_LoadTlut(int tile, int first, int count)
 }
 
 /* TEXTURE_RECTANGLE is four words: the rectangle, then the texture
- * coordinate at its top-left plus the per-pixel S/T steps (s10.5).
+ * coordinate at its top-left plus the per-pixel S/T steps (s5.10).
  *
  * The bottom-right corner is the last pixel in COPY/FILL cycle but one
  * past it in 1-/2-cycle -- using the COPY form under 1-cycle mode drops
- * the rectangle's right column and bottom row. COPY also retires four
- * pixels per RDP cycle, so its S step has to be four texels' worth
- * (4096 in s10.5) where 1-cycle advances one texel per pixel (1024). */
-void RDP_TextureRectangle(int tile, int x0, int y0, int x1, int y1, int s, int t)
+ * the rectangle's right column and bottom row. */
+void RDP_TextureRectangleXF(int tile, int x0, int y0, int x1, int y1,
+                             int s, int t, int dsdx, int dtdy)
 {
     if (x1 <= x0 || y1 <= y0)
         return;
@@ -336,8 +357,16 @@ void RDP_TextureRectangle(int tile, int x0, int y0, int x1, int y1, int s, int t
     u32 w1 = (((u32)tile & 7u) << 24) | (ToFx102(x0) << 12) | ToFx102(y0);
     DlCmd(w0, w1);
 
-    u32 dsdx = (sCycle == CYCLE_COPY) ? 4096u : 1024u;
     u32 w2 = (((u32)(s * 32) & 0xFFFFu) << 16) | ((u32)(t * 32) & 0xFFFFu);
-    u32 w3 = ((dsdx & 0xFFFFu) << 16) | (1024u & 0xFFFFu);
+    u32 w3 = (((u32)dsdx & 0xFFFFu) << 16) | ((u32)dtdy & 0xFFFFu);
     DlCmd(w2, w3);
+}
+
+/* The unflipped 1:1 case: one texel per pixel in each axis. COPY retires
+ * four pixels per RDP cycle, so its S step has to be four texels' worth
+ * (4096 in s5.10) where 1-cycle advances one texel per pixel (1024). */
+void RDP_TextureRectangle(int tile, int x0, int y0, int x1, int y1, int s, int t)
+{
+    int dsdx = (sCycle == CYCLE_COPY) ? 4096 : 1024;
+    RDP_TextureRectangleXF(tile, x0, y0, x1, y1, s, t, dsdx, 1024);
 }
