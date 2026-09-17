@@ -17,8 +17,14 @@
 # The ROM sums a fixed span of VBlanks and freezes the totals (see
 # N64_PROFILE_OVERLAY in src/n64/gpu_regs_n64.c), so both emulators measure
 # the same stretch of the same scene and the run is reproducible to the
-# count. The headline number is `frames`: how many frames were composited
-# inside that span of game time.
+# count.
+#
+# `frames` is how many frames were composited inside that span of game time,
+# but it is a quantised measure: the main loop waits for VBlank, so a frame
+# costs a whole number of VBlank periods and the rate sits on a step. Read
+# `bg/f` and `spr/f` -- the two rendering passes in CP0 counts per frame --
+# for anything smaller than a step. One VBlank period is 781,250 counts on
+# ares and about 1.56M instructions on mupen64plus.
 #
 # Requires N64_PROFILE_OVERLAY set to 1 and both ROMs built.
 set -u
@@ -37,7 +43,8 @@ read_one() {
     python3 "$ROOT/tools/decode_profile.py" --labels "$LABELS" "$1" 2>/dev/null | awk '
         /^  bg /{bg=$2} /^  spr /{spr=$2} /^  idle /{id=$2} /^  frames /{f=$2} /^  calib300k /{cal=$2}
         END { if (f == "" || bg == "") print "decode failed";
-              else printf "frames=%-6s bg=%-13s spr=%-12s idle=%-12s calib=%s\n", f, bg, spr, id, cal }'
+              else printf "frames=%-6s bg/f=%-9.0f spr/f=%-8.0f render/f=%-9.0f calib=%s\n", \
+                          f, bg/f, spr/f, (bg+spr)/f, cal }'
 }
 printf "%-22s " "mupen64plus+angrylion"; read_one "$OUT/mupen/shot.png"
 printf "%-22s " "ares"                 ; read_one "$OUT/ares/shot.png"

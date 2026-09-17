@@ -360,9 +360,52 @@ void EmitTileRow4(u16 *o, u32 w, const u16 *pal,
             PAIR_BASE(q, 2, p2, fp);
             PAIR_BASE(q, 3, p3, fp);
         }
+    } else if (mode != LAYER_WRITE && n == 8 && !hFlip) {
+        /* The same tile, landing half a pixel out. A scroll offset with an
+         * odd low bit puts every tile of the line on an odd halfword, which
+         * used to drop the whole line onto the eight-store path below --
+         * about a sixth of everything drawn. The pairs can straddle the
+         * bytes instead: one pixel on its own at each end, and three pairs
+         * in between, each built from the tail of one table entry and the
+         * head of the next. */
+        u32 P0 = bankPairs[(w >> 24) & 0xFF];
+        u32 P1 = bankPairs[(w >> 16) & 0xFF];
+        u32 P2 = bankPairs[(w >>  8) & 0xFF];
+        u32 P3 = bankPairs[w & 0xFF];
+
+        if (mode == LAYER_OVER && w == 0) {
+            /* blank tile, nothing to overlay */
+        } else {
+            u32 *q = (u32 *)(o + 1);
+            u32 c1 = (P0 << 16) | (P1 >> 16);
+            u32 c2 = (P1 << 16) | (P2 >> 16);
+            u32 c3 = (P2 << 16) | (P3 >> 16);
+            u16 lead = (u16)(P0 >> 16);
+            u16 tail = (u16)P3;
+
+            if (((P0 & P1 & P2 & P3) & PAIR_BOTH) == PAIR_BOTH) {
+                o[0] = lead;
+                q[0] = c1;
+                q[1] = c2;
+                q[2] = c3;
+                o[7] = tail;
+            } else if (mode == LAYER_BASE) {
+                u32 fp = ((u32)fill << 16) | fill;
+                o[0] = lead ? lead : fill;
+                PAIR_BASE(q, 0, c1, fp);
+                PAIR_BASE(q, 1, c2, fp);
+                PAIR_BASE(q, 2, c3, fp);
+                o[7] = tail ? tail : fill;
+            } else {
+                if (lead) o[0] = lead;
+                PAIR_OVER(q, o, 1, 0, c1);
+                PAIR_OVER(q, o, 1, 1, c2);
+                PAIR_OVER(q, o, 1, 2, c3);
+                if (tail) o[7] = tail;
+            }
+        }
     } else if (n == 8 && !hFlip) {
-        /* A whole unflipped tile: a layer or an alignment with no table of
-         * its own. */
+        /* A whole unflipped tile with no table to draw it from. */
         if (mode == LAYER_OVER && w == 0) {
             /* blank tile, nothing to overlay */
         } else {
