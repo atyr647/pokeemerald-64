@@ -272,6 +272,22 @@ static void BuildPaletteCache(const u16 *pltt)
         }                                                                   \
     } while (0)
 
+/* The same pair, for the bottom layer: nothing shows through it, so a
+ * transparent pixel becomes the backdrop and every pair is one store.
+ * `fp` is the backdrop doubled into a word. */
+#define PAIR_BASE(q, i, pairval, fp)                                        \
+    do {                                                                    \
+        u32 p__ = (pairval);                                                \
+        if ((p__ & PAIR_BOTH) == PAIR_BOTH) { (q)[i] = p__; }               \
+        else if (!p__) { (q)[i] = (fp); }                                   \
+        else {                                                              \
+            u32 hi__ = p__ >> 16, lo__ = p__ & 0xFFFFu;                     \
+            if (!hi__) hi__ = (fp) >> 16;                                   \
+            if (!lo__) lo__ = (fp) & 0xFFFFu;                               \
+            (q)[i] = (hi__ << 16) | lo__;                                   \
+        }                                                                   \
+    } while (0)
+
 #define LAYER_PUT(dst, colour)                       \
     do {                                             \
         u16 c_ = (colour);                           \
@@ -322,9 +338,31 @@ void EmitTileRow4(u16 *o, u32 w, const u16 *pal,
                 PAIR_OVER(q, o, 0, 3, p3);
             }
         }
+    } else if (mode == LAYER_BASE && n == 8 && !hFlip && !(((uintptr_t)o) & 3)) {
+        /* The bottom layer, through the same table: nothing shows through
+         * it, so a transparent pixel is just the backdrop and every pair is
+         * one store rather than two. */
+        u32 *q = (u32 *)o;
+        u32 p0 = bankPairs[(w >> 24) & 0xFF];
+        u32 p1 = bankPairs[(w >> 16) & 0xFF];
+        u32 p2 = bankPairs[(w >>  8) & 0xFF];
+        u32 p3 = bankPairs[w & 0xFF];
+
+        if (((p0 & p1 & p2 & p3) & PAIR_BOTH) == PAIR_BOTH) {
+            q[0] = p0;
+            q[1] = p1;
+            q[2] = p2;
+            q[3] = p3;
+        } else {
+            u32 fp = ((u32)fill << 16) | fill;
+            PAIR_BASE(q, 0, p0, fp);
+            PAIR_BASE(q, 1, p1, fp);
+            PAIR_BASE(q, 2, p2, fp);
+            PAIR_BASE(q, 3, p3, fp);
+        }
     } else if (n == 8 && !hFlip) {
-        /* A whole unflipped tile: the bottom layer, which has no table of
-         * its own, or one that fell on an odd pixel. */
+        /* A whole unflipped tile: a layer or an alignment with no table of
+         * its own. */
         if (mode == LAYER_OVER && w == 0) {
             /* blank tile, nothing to overlay */
         } else {
@@ -448,7 +486,7 @@ void RenderTextLineImpl(const BgDesc *bg, int y, u16 *out, int mode, u16 fill)
                                    + tileNum * TILE_SIZE_4BPP + py * 4);
             int bank = (entry >> 12) & 0xF;
 
-            if (mode == LAYER_OVER && bank != lastBank) {
+            if (mode != LAYER_WRITE && bank != lastBank) {
                 lastBank = bank;
                 if (!(sPairBuilt & (1u << bank)))
                     BuildPairBank(bank);
@@ -545,7 +583,7 @@ void RenderTextBandImpl(const BgDesc *bg, int y0, int rows, int mode, u16 fill)
             if (x + cols > DISPLAY_WIDTH)
                 cols = DISPLAY_WIDTH - x;
 
-            if (mode == LAYER_OVER && bank != lastBank) {
+            if (mode != LAYER_WRITE && bank != lastBank) {
                 lastBank = bank;
                 if (!(sPairBuilt & (1u << bank)))
                     BuildPairBank(bank);
