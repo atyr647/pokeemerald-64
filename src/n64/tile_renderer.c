@@ -188,32 +188,39 @@ static u16 sPal4[256];
 static u16 sPal8[256];
 
 /* -----------------------------------------------------------------------
- * Pixel-pair tables
+ * Pixel-pair table
  *
  * A 4bpp tile row is one word: four bytes, each holding two pixels. For a
  * layer drawn over what is already there -- which is three of the four, and
  * most of the frame -- looking the byte up rather than its two nibbles
- * turns a tile into four loads and four stores instead of eight of each,
- * and a class byte says whether the pair can go out whole.
+ * turns a tile into four loads and four stores instead of eight of each.
  *
  *   sPairs[bank][byte]   the two pixels, ready to store as one word
- *   sPairCls[bank][byte] 0 = both transparent, 1 = both opaque, 2 = mixed
  *
- * Only these two tables exist, and only the overlay path uses them: giving
- * the bottom layer its own copy with the backdrop substituted was another
- * 16 KB against an 8 KB data cache for a layer that is an eighth of the
- * work. Banks are built on first use in a frame, so a scene pays for the
- * handful it draws with rather than all sixteen.
+ * Whether a pair can go out whole is read off the entry itself rather than
+ * a second table: every opaque colour carries the RGBA5551 alpha bit and a
+ * transparent one is zero, so both pixels are opaque exactly when
+ * `p & 0x00010001 == 0x00010001`, and the four pairs of a tile row can be
+ * tested together by ANDing them first. A class table alongside this one
+ * was another 4 KB of the 8 KB data cache for something two instructions
+ * recover.
+ *
+ * Only the overlay path uses the table: giving the bottom layer its own
+ * copy with the backdrop substituted, or even sharing this one, measurably
+ * lost -- the extra banks push the working set past the cache for a layer
+ * that is a quarter of the work. Banks are built on first use in a frame,
+ * so a scene pays for the handful it draws with rather than all sixteen.
  * --------------------------------------------------------------------- */
 static u32 sPairs[16][256];
-static u8  sPairCls[16][256];
 static u16 sPairBuilt;   /* bank bitmask, cleared each frame */
+
+/* Both pixels of a pair opaque. */
+#define PAIR_BOTH 0x00010001u
 
 static void BuildPairBank(u32 bank)
 {
     const u16 *pal = sPal4 + bank * 16;
     u32 *pairs = sPairs[bank];
-    u8  *cls   = sPairCls[bank];
 
     for (int b = 0; b < 256; b++) {
         /* Within a byte the low nibble is the left pixel. */
@@ -221,7 +228,6 @@ static void BuildPairBank(u32 bank)
         u16 p1 = pal[b >> 4];
 
         pairs[b] = ((u32)p0 << 16) | p1;
-        cls[b]   = (p0 && p1) ? 1 : ((p0 | p1) ? 2 : 0);
     }
 
     sPairBuilt |= (u16)(1u << bank);
@@ -256,12 +262,11 @@ static void BuildPaletteCache(const u16 *pltt)
 
 /* One pixel pair of an overlaying layer: store it whole when both pixels
  * are opaque, drop it when neither is, otherwise one at a time. */
-#define PAIR_OVER(q, o, x, i, cls, pairval)                                 \
+#define PAIR_OVER(q, o, x, i, pairval)                                      \
     do {                                                                    \
-        u32 c__ = (cls);                                                    \
-        if (c__ == 1) { (q)[i] = (pairval); }                               \
-        else if (c__) {                                                     \
-            u32 p__ = (pairval);                                            \
+        u32 p__ = (pairval);                                                \
+        if ((p__ & PAIR_BOTH) == PAIR_BOTH) { (q)[i] = p__; }               \
+        else if (p__) {                                                     \
             if (p__ >> 16)     (o)[(x) + (i) * 2 + 0] = (u16)(p__ >> 16);   \
             if (p__ & 0xFFFFu) (o)[(x) + (i) * 2 + 1] = (u16)p__;           \
         }                                                                   \
@@ -285,7 +290,7 @@ static void BuildPaletteCache(const u16 *pltt)
  * --------------------------------------------------------------------- */
 static inline __attribute__((always_inline))
 void EmitTileRow4(u16 *o, u32 w, const u16 *pal,
-                  const u32 *bankPairs, const u8 *bankCls,
+                  const u32 *bankPairs,
                   int first, int n, int hFlip, int mode, u16 fill)
 {
     if (mode == LAYER_OVER && n == 8 && !hFlip && !(((uintptr_t)o) & 3)) {
@@ -298,23 +303,23 @@ void EmitTileRow4(u16 *o, u32 w, const u16 *pal,
              * tiles are most of what the upper layers hold. */
         } else {
             u32 *q = (u32 *)o;
-            u32 b0 = (w >> 24) & 0xFF, b1 = (w >> 16) & 0xFF;
-            u32 b2 = (w >>  8) & 0xFF, b3 = w & 0xFF;
-            u32 c0 = bankCls[b0], c1 = bankCls[b1];
-            u32 c2 = bankCls[b2], c3 = bankCls[b3];
+            u32 p0 = bankPairs[(w >> 24) & 0xFF];
+            u32 p1 = bankPairs[(w >> 16) & 0xFF];
+            u32 p2 = bankPairs[(w >>  8) & 0xFF];
+            u32 p3 = bankPairs[w & 0xFF];
 
             /* A fully opaque tile is the common case and skips the per-pair
              * tests entirely. */
-            if ((c0 & c1 & c2 & c3) == 1) {
-                q[0] = bankPairs[b0];
-                q[1] = bankPairs[b1];
-                q[2] = bankPairs[b2];
-                q[3] = bankPairs[b3];
+            if (((p0 & p1 & p2 & p3) & PAIR_BOTH) == PAIR_BOTH) {
+                q[0] = p0;
+                q[1] = p1;
+                q[2] = p2;
+                q[3] = p3;
             } else {
-                PAIR_OVER(q, o, 0, 0, c0, bankPairs[b0]);
-                PAIR_OVER(q, o, 0, 1, c1, bankPairs[b1]);
-                PAIR_OVER(q, o, 0, 2, c2, bankPairs[b2]);
-                PAIR_OVER(q, o, 0, 3, c3, bankPairs[b3]);
+                PAIR_OVER(q, o, 0, 0, p0);
+                PAIR_OVER(q, o, 0, 1, p1);
+                PAIR_OVER(q, o, 0, 2, p2);
+                PAIR_OVER(q, o, 0, 3, p3);
             }
         }
     } else if (n == 8 && !hFlip) {
@@ -410,7 +415,6 @@ void RenderTextLineImpl(const BgDesc *bg, int y, u16 *out, int mode, u16 fill)
      * are looked up once and carried along the line. */
     int lastBank = -1;
     const u32 *bankPairs = NULL;
-    const u8  *bankCls = NULL;
 
     int x = 0;
     while (x < DISPLAY_WIDTH)
@@ -449,10 +453,9 @@ void RenderTextLineImpl(const BgDesc *bg, int y, u16 *out, int mode, u16 fill)
                 if (!(sPairBuilt & (1u << bank)))
                     BuildPairBank(bank);
                 bankPairs = sPairs[bank];
-                bankCls   = sPairCls[bank];
             }
 
-            EmitTileRow4(out + x, w, sPal4 + bank * 16, bankPairs, bankCls,
+            EmitTileRow4(out + x, w, sPal4 + bank * 16, bankPairs,
                          first, n, hFlip, mode, fill);
         }
 
@@ -525,7 +528,6 @@ void RenderTextBandImpl(const BgDesc *bg, int y0, int rows, int mode, u16 fill)
 
         int lastBank = -1;
         const u32 *bankPairs = NULL;
-        const u8  *bankCls   = NULL;
 
         u16 *rowBase = gN64FrameBuf + (y0 + r) * FB_STRIDE;
 
@@ -548,7 +550,6 @@ void RenderTextBandImpl(const BgDesc *bg, int y0, int rows, int mode, u16 fill)
                 if (!(sPairBuilt & (1u << bank)))
                     BuildPairBank(bank);
                 bankPairs = sPairs[bank];
-                bankCls   = sPairCls[bank];
             }
 
             const u16 *pal      = sPal4 + bank * 16;
@@ -583,7 +584,7 @@ void RenderTextBandImpl(const BgDesc *bg, int y0, int rows, int mode, u16 fill)
                 int py = vFlip ? 7 - (rowInTile + i) : (rowInTile + i);
                 u32 w = *(const u32 *)(tileBase + py * 4);
                 EmitTileRow4(rowBase + i * FB_STRIDE + x, w, pal,
-                             bankPairs, bankCls, first, cols, hFlip, mode, fill);
+                             bankPairs, first, cols, hFlip, mode, fill);
             }
 
             x += cols;
