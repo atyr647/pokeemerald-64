@@ -725,30 +725,63 @@ static void RenderTextBandOver(const BgDesc *bg, int y0, int rows)
  * than as a negative step in TEXTURE_RECTANGLE, for the same reason: one
  * fewer RDP-side behaviour this renderer's correctness depends on.
  *
- * NOT YET CORRECT -- left disabled (N64_RDP_BG 0) until it is. Text and
- * most of a scene's tiles render right, matching the CPU path pixel for
- * pixel, but one reproducible defect remains: a patch of tiles renders as
- * a repeating diagonal weave instead of the right graphic, in the same
- * screen region across unrelated scenes (the intro logo's foreground
- * leaves, and separately the treetops on the overworld route behind the
- * player). Ruled out so far, each verified rather than assumed:
- *   - The per-tile cache (skipping LOAD_TILE when the same VRAM tile,
- *     bank and flip repeat). Forcing every tile through the full reload
- *     sequence every time, unconditionally, does not change it.
- *   - A missing SYNC_LOAD between one tile's LOAD_TILE and the previous
- *     tile's TEXTURE_RECTANGLE. Added (see below); did not fix it.
- *   - The scratch buffer's address staying fixed from one tile to the
- *     next, in case something keyed off the SET_TEXTURE_IMAGE address
- *     rather than reading it fresh. Rotating it through four slots did
- *     not fix it.
- *   - A tile's command group (reload + rectangle) being split across two
- *     display-list submissions by the auto-flush inside DlCmd(). Reserving
- *     room for the whole group up front (RDP_Reserve) did not fix it.
- * What is left unruled out: an actual hardware/emulator RDP pipeline
- * hazard neither of the above addresses, or a logic bug in this file that
- * close reading has not caught. Whichever it is, it needs either real
- * hardware, a cycle-level RDP trace, or fresh eyes -- not another guess
- * from this list. See the session notes for the elimination log in full.
+ * NOT YET CORRECT -- left disabled (N64_RDP_BG 0) until it is. This is not
+ * a minor cosmetic defect: on the intro logo, the entire detailed
+ * foreground layer (the big leaf silhouettes and dew-drop highlights
+ * behind the GAME FREAK logo) renders as a repeating diagonal weave
+ * instead of the real graphic. The same failure shows on the overworld
+ * route's treetops. Text and most other tiles render correctly, matching
+ * the CPU path pixel for pixel -- this is not a wrong-mode or
+ * wrong-format problem, it is specific to this content.
+ *
+ * Ruled out, each by an actual A/B test rather than by inspection alone:
+ *   - The per-tile reload cache. Forcing every tile through the full
+ *     SET_TEXTURE_IMAGE/SET_TILE/LOAD_TILE sequence every time,
+ *     unconditionally, does not change it.
+ *   - A missing SYNC_LOAD between one tile's load and the previous
+ *     tile's draw. Added (kept, it is correct regardless) -- no change.
+ *   - The scratch texture's address staying fixed tile to tile, in case
+ *     something keyed off the SET_TEXTURE_IMAGE address rather than
+ *     reading it fresh. Rotated through four slots -- no change.
+ *   - A tile's command group being split across two display-list
+ *     submissions by DlCmd()'s auto-flush. RDP_Reserve guarantees the
+ *     whole group lands in one batch (kept) -- no change.
+ *   - A missing half-texel offset on the bilinear-filtered sample (the
+ *     bi_lerp bits this port sets to dodge YUV mode really do turn on
+ *     filtering, and an unfiltered s=0 sample lands exactly on a texel
+ *     edge). Fixed (kept, it is a real, separate bug) -- no change to
+ *     this defect specifically.
+ *   - Screen-space tile position. Replacing every tile's draw with a
+ *     FILL_RECTANGLE checkerboard keyed on (dstX,dstY) -- bypassing the
+ *     texture path entirely -- comes out perfectly regular everywhere,
+ *     including this exact region: the tile grid itself is right.
+ *   - Tile selection. Colouring every tile by its tileNum instead of
+ *     texturing it produces a smoothly varying result with no anomaly
+ *     in the affected region: the right tiles are being read.
+ *   - Bank selection. Colouring by bank alone gives large, uniform,
+ *     stable blocks with no distortion: bank is not jumping around.
+ *   - Content structure. Synthetic per-row, per-column, and mixed-alpha
+ *     (opaque/transparent checkerboard, matching what a feathered real
+ *     edge looks like) test patterns, run through the exact same
+ *     pipeline in place of the real pixels, all come out clean -- so it
+ *     is not "high-contrast detail" or "transparency mixed with opaque"
+ *     in the abstract.
+ *   - Timing. A large, deliberate delay inserted before this renderer
+ *     touches VRAM at all -- to test whether some other, slower part of
+ *     the game (a ROM-to-VRAM DMA the GBA original could assume finishes
+ *     instantly but this port's DMA may not) was still writing this
+ *     content when it got read -- changes nothing: the result is
+ *     bit-for-bit identical with and without it. This is not a race.
+ *
+ * What that leaves: every *synthetic* value or pattern put through this
+ * exact pipeline renders correctly, and only the *real* decoded pixels
+ * for this specific content do not, deterministically. That points at
+ * either the actual palette values this content's bank converts to, or
+ * the actual VRAM byte pattern for these specific tiles, doing something
+ * to the RDP or to angrylion's model of it that no synthetic stand-in
+ * tried so far has reproduced. Pulling the real failing tile's bytes and
+ * palette out of a live run and replaying just those, by hand, is the
+ * next thing to try -- not another guessed pattern.
  * --------------------------------------------------------------------- */
 #define N64_RDP_BG 0
 #if N64_RDP_BG

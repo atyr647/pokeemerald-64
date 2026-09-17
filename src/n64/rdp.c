@@ -71,6 +71,7 @@ extern u8 __rdp_dlist_end[];
 static u32 sDlOff;      /* write cursor, bytes from the start of the half */
 static u32 sBufIndex;   /* which half is currently being written, 0 or 1  */
 static u32 sCycle;      /* the cycle type the last mode setter selected   */
+static int sBilerp;      /* the last mode setter turned the texture filter on */
 
 static u32 CurrentBase(void)
 {
@@ -85,6 +86,7 @@ void RDP_Init(void)
     sDlOff = 0;
     sBufIndex = 0;
     sCycle = CYCLE_FILL;
+    sBilerp = 0;
     DP_WR(DPC_STATUS_REG, DPC_CLR_XBUS | DPC_CLR_FREEZE | DPC_CLR_FLUSH);
 }
 
@@ -200,6 +202,7 @@ void RDP_SetModeFill(u16 rgba5551)
 {
     RDP_SyncPipe();
     sCycle = CYCLE_FILL;
+    sBilerp = 0;
     SetOtherModes(CYCLE_FILL << 20, 0);
     RDP_SetFillColor16(rgba5551);
 }
@@ -211,6 +214,7 @@ void RDP_SetModeCopy(void)
 {
     RDP_SyncPipe();
     sCycle = CYCLE_COPY;
+    sBilerp = 0;
     SetOtherModes(CYCLE_COPY << 20, 0x00000001u);
 }
 
@@ -221,11 +225,20 @@ void RDP_SetModeCopy(void)
  * though nothing here wants filtering -- leaving them clear puts the
  * texture filter unit in its YUV convert mode instead, which reads an
  * RGBA texture as chroma and returns black. Combiner: (0-0)*0+TEX0 for
- * both colour and alpha, in both cycles. */
+ * both colour and alpha, in both cycles.
+ *
+ * Real filtering is the price: with those bits set the texture unit
+ * samples bilinearly, not at a point, and RDP_TextureRectangle has to
+ * compensate with a half-texel offset (see there) or every sample lands
+ * exactly on a texel edge and blends 50/50 with its neighbour -- which
+ * is invisible on a flat fill and severe on anything with sharp detail,
+ * which is exactly backwards from a bug you'd catch by eye on a test
+ * pattern. sBilerp is what tells RDP_TextureRectangle to add it. */
 void RDP_SetModeStandard(void)
 {
     RDP_SyncPipe();
     sCycle = CYCLE_1CYCLE;
+    sBilerp = 1;
     u32 filt = (1u << 11) | (1u << 10);
     u32 blend = (1u << 22) | (1u << 20);
     SetOtherModes((CYCLE_1CYCLE << 20) | filt, blend | 0x00006040u);
@@ -241,6 +254,7 @@ void RDP_SetModeStandardTlut(void)
 {
     RDP_SyncPipe();
     sCycle = CYCLE_1CYCLE;
+    sBilerp = 1;
     u32 filt = (1u << 11) | (1u << 10);
     u32 blend = (1u << 22) | (1u << 20);
     u32 enTlut = (1u << 15);
@@ -343,9 +357,13 @@ void RDP_LoadTlut(int tile, int first, int count)
  *
  * The bottom-right corner is the last pixel in COPY/FILL cycle but one
  * past it in 1-/2-cycle -- using the COPY form under 1-cycle mode drops
- * the rectangle's right column and bottom row. */
+ * the rectangle's right column and bottom row.
+ *
+ * sHalf/tHalf are in HALF-texel units (a whole texel is 2), not whole
+ * texels -- the extra precision is what lets RDP_TextureRectangle below
+ * express the half-texel offset a bilinear sample needs. */
 void RDP_TextureRectangleXF(int tile, int x0, int y0, int x1, int y1,
-                             int s, int t, int dsdx, int dtdy)
+                             int sHalf, int tHalf, int dsdx, int dtdy)
 {
     if (x1 <= x0 || y1 <= y0)
         return;
@@ -357,16 +375,28 @@ void RDP_TextureRectangleXF(int tile, int x0, int y0, int x1, int y1,
     u32 w1 = (((u32)tile & 7u) << 24) | (ToFx102(x0) << 12) | ToFx102(y0);
     DlCmd(w0, w1);
 
-    u32 w2 = (((u32)(s * 32) & 0xFFFFu) << 16) | ((u32)(t * 32) & 0xFFFFu);
+    u32 w2 = (((u32)(sHalf * 16) & 0xFFFFu) << 16) | ((u32)(tHalf * 16) & 0xFFFFu);
     u32 w3 = (((u32)dsdx & 0xFFFFu) << 16) | ((u32)dtdy & 0xFFFFu);
     DlCmd(w2, w3);
 }
 
 /* The unflipped 1:1 case: one texel per pixel in each axis. COPY retires
  * four pixels per RDP cycle, so its S step has to be four texels' worth
- * (4096 in s5.10) where 1-cycle advances one texel per pixel (1024). */
+ * (4096 in s5.10) where 1-cycle advances one texel per pixel (1024).
+ *
+ * bi_lerp0/bi_lerp1 being forced on (see RDP_SetModeStandard) means the
+ * texture unit samples bilinearly whenever it is set, and a bilinear
+ * sample at an integer texel coordinate lands exactly on the boundary
+ * between that texel and its neighbour, blending the two 50/50 instead of
+ * reading the one that was asked for. Centring the sample -- offsetting
+ * by half a texel -- is what a filtered read always needs; point-sampled
+ * reads (FILL, COPY) must not get it, or they end up a half-texel off
+ * the other way. A real, separate bug from the background renderer's own
+ * still-open one (see the comment above RenderTextLayerRDP in
+ * tile_renderer.c) -- fixing this did not fix that. */
 void RDP_TextureRectangle(int tile, int x0, int y0, int x1, int y1, int s, int t)
 {
     int dsdx = (sCycle == CYCLE_COPY) ? 4096 : 1024;
-    RDP_TextureRectangleXF(tile, x0, y0, x1, y1, s, t, dsdx, 1024);
+    int half = sBilerp ? 1 : 0;
+    RDP_TextureRectangleXF(tile, x0, y0, x1, y1, s * 2 + half, t * 2 + half, dsdx, 1024);
 }

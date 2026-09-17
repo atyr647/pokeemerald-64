@@ -111,14 +111,17 @@ void RDP_LoadTlut(int tile, int first, int count);
  * alpha-blend. */
 void RDP_TextureRectangle(int tile, int x0, int y0, int x1, int y1, int s, int t);
 
-/* The general form: an explicit starting texel and per-pixel step in each
- * axis (s5.10 fixed point -- 1024 is one texel), so a negative step reads
- * a tile backwards for a horizontal or vertical flip. RDP_TextureRectangle
- * is this with the unflipped 1:1 case's steps filled in. Only valid in
- * 1-/2-cycle mode: COPY's four-texels-per-cycle stepping does not have a
- * sensible reverse direction. */
+/* The general form: an explicit starting position, in HALF-texel units (a
+ * whole texel is 2 -- the extra precision is for callers that need to
+ * offset a sample by half a texel; see RDP_TextureRectangle), and a
+ * per-pixel step in each axis (s5.10 fixed point -- 1024 is one texel), so
+ * a negative step reads a tile backwards for a horizontal or vertical
+ * flip. RDP_TextureRectangle is this with the unflipped 1:1 case's
+ * position and steps filled in. Only valid in 1-/2-cycle mode: COPY's
+ * four-texels-per-cycle stepping does not have a sensible reverse
+ * direction. */
 void RDP_TextureRectangleXF(int tile, int x0, int y0, int x1, int y1,
-                             int s, int t, int dsdx, int dtdy);
+                             int sHalf, int tHalf, int dsdx, int dtdy);
 
 /* Writes back the CPU data cache over [addr, addr+len) unless addr is
  * already an uncached (KSEG1) alias. Every texture source the RDP reads --
