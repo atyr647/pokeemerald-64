@@ -784,6 +784,7 @@ static void RenderTextBandOver(const BgDesc *bg, int y0, int rows)
  * next thing to try -- not another guessed pattern.
  * --------------------------------------------------------------------- */
 #define N64_RDP_BG 0
+#define N64_RDP_BG_DUMP_TILE 0
 #if N64_RDP_BG
 #include "n64/rdp.h"
 
@@ -820,7 +821,7 @@ static u16 *BuildRdpTileScratch(const u8 *tileBase, int bank, int hFlip, int vFl
     return scratch;
 }
 
-static void RenderTextLayerRDP(const BgDesc *bg)
+static void RenderTextLayerRDP(const BgDesc *bg, int layerSlot, int layerCount)
 {
     const u8 *vram       = VramBuf();
     const int screenSize = bg->screenSize;
@@ -862,6 +863,45 @@ static void RenderTextLayerRDP(const BgDesc *bg)
             const u64 *q = (const u64 *)tileBase;
             if ((q[0] | q[1] | q[2] | q[3]) == 0)
                 continue;   /* blank: the backdrop fill already covers it */
+
+#if N64_RDP_BG_DUMP_TILE
+            /* One-shot data dump: the Nth non-blank tile of the last
+             * (frontmost) drawn layer, dumped as raw data -- not decoded
+             * through this renderer -- so it can be cross-checked by
+             * hand. Each field gets its own widely-separated 16-pixel-
+             * tall block, well clear of anything else, in the bottom
+             * border (never touched by the RDP draws above). */
+            if (layerSlot == layerCount - 1) {
+                extern u16 *gN64BackBuffer;
+                static int sSeen = 0;
+                static int sDumped = 0;
+                sSeen++;
+                if (!sDumped && sSeen == 30) {
+                    sDumped = 1;
+                    const u16 *pal = sPal4 + bank * 16;
+                    /* Block A (y 200-216): the 16 palette entries for this
+                     * bank, 16px square each, as their real colour. */
+                    for (int i = 0; i < 16; i++)
+                        for (int py = 0; py < 16; py++)
+                            for (int px = 0; px < 16; px++)
+                                gN64BackBuffer[(200 + py) * FB_STRIDE + i * 16 + px] = pal[i];
+                    /* Block B (y 220-236): the 64 raw nibbles of this tile,
+                     * unflipped, row-major, 8px square each (512px wide --
+                     * fits, VI width is 320... no it does not. Split into
+                     * two rows of 32 instead. */
+                    for (int i = 0; i < 64; i++) {
+                        u8 byte = tileBase[i >> 1];
+                        int nibble = (i & 1) ? (byte >> 4) : (byte & 0xF);
+                        int col = i % 32, row = i / 32;
+                        u32 v5 = (u32)nibble * 2;   /* 0-15 -> 0-30, a 5-bit value */
+                        u16 c = (u16)((v5 << 11) | (v5 << 6) | (v5 << 1) | 1);
+                        for (int py = 0; py < 8; py++)
+                            for (int px = 0; px < 8; px++)
+                                gN64BackBuffer[(220 + row * 10 + py) * FB_STRIDE + col * 8 + px] = c;
+                    }
+                }
+            }
+#endif
 
             s32 key = (s32)(((uintptr_t)tileBase << 6)
                            | (bank << 2) | (hFlip << 1) | vFlip);
@@ -1213,6 +1253,18 @@ void N64_CompositeFrame(void)
             bandable = 0;
     }
 
+#if N64_RDP_BG_DUMP_TILE
+    /* DIAGNOSTIC: bandable state, top-left border, so it is legible
+     * regardless of which branch below runs. Green = true, red = false. */
+    {
+        extern u16 *gN64BackBuffer;
+        u16 c = bandable ? 0x07E1u : 0xF801u;
+        for (int py = 0; py < 8; py++)
+            for (int px = 0; px < 8; px++)
+                gN64BackBuffer[(30 + py) * FB_STRIDE + px] = c;
+    }
+#endif
+
     if (bandable) {
 #if N64_RDP_BG
         RdpBgBeginFrame();
@@ -1222,7 +1274,7 @@ void N64_CompositeFrame(void)
         RDP_FillRectangle(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT);
         RDP_SetModeStandard();
         for (int d = 0; d < drawCount; d++)
-            RenderTextLayerRDP(&bgs[drawOrder[d]]);
+            RenderTextLayerRDP(&bgs[drawOrder[d]], d, drawCount);
         RDP_Submit();
         return;
 #else
