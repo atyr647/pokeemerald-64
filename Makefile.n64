@@ -190,7 +190,8 @@ MID          := tools/mid2agb/mid2agb
 WAV2AGB      := tools/wav2agb/wav2agb
 SAMPLE_WAVS  := $(sort $(wildcard sound/direct_sound_samples/*.wav))
 CRY_WAVS     := $(sort $(wildcard sound/direct_sound_samples/cries/*.wav))
-SAMPLE_BINS  := $(SAMPLE_WAVS:.wav=.bin) $(CRY_WAVS:.wav=.bin)
+PHONEME_WAVS := $(sort $(wildcard sound/direct_sound_samples/phonemes/*.wav))
+SAMPLE_BINS  := $(SAMPLE_WAVS:.wav=.bin) $(CRY_WAVS:.wav=.bin) $(PHONEME_WAVS:.wav=.bin)
 
 MID_SRCS := $(sort $(wildcard $(MID_SUBDIR)/*.mid))
 MID_OBJS := $(patsubst $(MID_SUBDIR)/%.mid, $(MID_BUILDDIR)/%.o, $(MID_SRCS))
